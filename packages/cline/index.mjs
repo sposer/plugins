@@ -8,6 +8,7 @@
 // ClinePass, the plan's 5-hour, weekly and monthly limits.
 import { STATUS_CODES } from "node:http"
 import { createHash } from "node:crypto"
+import { setTimeout as delay } from "node:timers/promises"
 
 const PROVIDER = "cline"
 const API = "https://api.cline.bot/api/v1"
@@ -109,7 +110,7 @@ function timeOf(m, keys) {
 	return ""
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const sleep = (ms, signal) => delay(ms, undefined, { signal })
 
 // ---- the sign-in as it is kept --------------------------------------------------
 
@@ -232,20 +233,22 @@ async function refresh(a) {
 // ---- the device sign-in ----------------------------------------------------------
 
 // deviceAuthorize starts the flow: a code to approve in the browser
-async function deviceAuthorize() {
+async function deviceAuthorize(signal) {
+	signal?.throwIfAborted()
 	let res
 	try {
 		res = await fetch(WORKOS_DEVICE, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
 			body: new URLSearchParams({ client_id: WORKOS_CLIENT }).toString(),
-			signal: AbortSignal.timeout(15_000),
+			signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
 		})
 	} catch (e) {
 		throw new Error(`Cline sign-in: ${e?.message ?? e}`)
 	}
 	if (!res.ok) throw new Error(`Cline sign-in: the device code request failed (HTTP ${res.status})`)
 	const d = await res.json().catch(() => null)
+	signal?.throwIfAborted()
 	if (!d?.device_code || !d?.verification_uri) throw new Error("Cline sign-in: the device code answer was incomplete")
 	return d
 }
@@ -254,11 +257,15 @@ async function deviceAuthorize() {
 // interval only grows (slow_down raises it for every later poll, RFC 8628), it
 // starts at a second, and a 5xx, a non-JSON reply or a network error is a poll
 // to try again, not the sign-in failing.
-async function pollDevice(d, { fetchImpl = fetch, sleep: sleeper = sleep, now = Date.now } = {}) {
-	const deadline = now() + Math.min(Number(d?.expires_in) > 0 ? Number(d.expires_in) : 300, DEVICE_CAP) * 1000
+const deviceLifetime = (d) => Math.min(Number(d?.expires_in) > 0 ? Number(d.expires_in) : 300, DEVICE_CAP) * 1000
+
+async function pollDevice(d, { fetchImpl = fetch, sleep: sleeper = sleep, now = Date.now, deadline = now() + deviceLifetime(d), signal } = {}) {
+	signal?.throwIfAborted()
 	let interval = Math.max(1, Number(d?.interval) > 0 ? Math.floor(Number(d.interval)) : 5)
 	while (now() < deadline) {
-		await sleeper(interval * 1000)
+		await sleeper(Math.min(interval * 1000, deadline - now()), signal)
+		signal?.throwIfAborted()
+		if (now() >= deadline) break
 		let res = null
 		let j = null
 		try {
@@ -266,10 +273,12 @@ async function pollDevice(d, { fetchImpl = fetch, sleep: sleeper = sleep, now = 
 				method: "POST",
 				headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
 				body: new URLSearchParams({ grant_type: DEVICE_GRANT, device_code: d.device_code, client_id: WORKOS_CLIENT }).toString(),
-				signal: AbortSignal.timeout(15_000),
+				signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
 			})
 			j = await res.json().catch(() => null)
 		} catch {}
+		signal?.throwIfAborted()
+		if (now() >= deadline) break
 		// WorkOS having a moment, or the network: not the sign-in
 		if (!res || res.status >= 500) continue
 		// a reply that isn't JSON and isn't a 5xx is the poll turned away: an
@@ -294,27 +303,49 @@ async function pollDevice(d, { fetchImpl = fetch, sleep: sleeper = sleep, now = 
 // deviceSignIn is the browser method: the device code page opened, WorkOS
 // polled until the code is approved, and the WorkOS tokens traded at Cline's
 // register endpoint for the account's own pair
-async function deviceSignIn() {
-	const d = await deviceAuthorize()
+async function deviceSignIn(_inputs, { signal } = {}) {
+	let d
+	try {
+		d = await deviceAuthorize(signal)
+		signal?.throwIfAborted()
+	} catch (e) {
+		return { type: "failed", error: e?.message ?? String(e) }
+	}
+	const controller = new AbortController()
+	const lifetime = deviceLifetime(d)
+	const deadline = Date.now() + lifetime
+	const cancel = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+	const timer = setTimeout(() => controller.abort(new Error("the sign-in wasn't finished in time")), lifetime)
+	timer.unref?.()
+	const close = () => { clearTimeout(timer); cancel.removeEventListener("abort", close) }
+	cancel.addEventListener("abort", close, { once: true })
+	if (cancel.aborted) close()
+	let result
+	// decision: keep the absolute device deadline and one completion promise;
+	// not a fresh poll per callback because repeated completion must not register twice.
 	return {
 		url: firstOf(d.verification_uri_complete, d.verification_uri, "https://app.cline.bot"),
 		instructions: `Approve the sign-in in the browser${d.user_code ? ` — the code is ${d.user_code}` : ""}.`,
 		method: "auto",
-		async callback() {
-			let j
-			try {
-				j = await pollDevice(d)
-			} catch (e) {
-				return { type: "failed", error: e?.message ?? String(e) }
-			}
-			try {
-				const data = await clineApi(`${API}/auth/register`, { method: "POST", body: { accessToken: j.access_token, refreshToken: j.refresh_token ?? "" }, signal: AbortSignal.timeout(30_000) })
-				const p = parseAuth(data, j.refresh_token ?? "")
-				if (p.error) throw new Error(`Cline sign-in: ${p.error}`)
-				return { type: "success", ...p }
-			} catch (e) {
-				return { type: "failed", error: e?.message ?? String(e) }
-			}
+		callback(_code, { signal: callbackSignal } = {}) {
+			if (!result) result = (async () => {
+				const active = callbackSignal ? AbortSignal.any([cancel, callbackSignal]) : cancel
+				try {
+					active.throwIfAborted()
+					const j = await pollDevice(d, { deadline, signal: active })
+					active.throwIfAborted()
+					const data = await clineApi(`${API}/auth/register`, { method: "POST", body: { accessToken: j.access_token, refreshToken: j.refresh_token ?? "" }, signal: AbortSignal.any([active, AbortSignal.timeout(30_000)]) })
+					active.throwIfAborted()
+					const p = parseAuth(data, j.refresh_token ?? "")
+					if (p.error) throw new Error(`Cline sign-in: ${p.error}`)
+					return { type: "success", ...p }
+				} catch (e) {
+					return { type: "failed", error: e?.message ?? String(e) }
+				} finally {
+					close()
+				}
+			})()
+			return result
 		},
 	}
 }

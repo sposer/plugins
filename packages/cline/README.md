@@ -9,7 +9,11 @@ Provider id: `cline`.
 - **Cline device sign-in** — the flow Cline's own client runs: the plugin asks
   WorkOS for a device code and opens the approval page, polls until you
   approve, then trades the WorkOS tokens at Cline's `/api/v1/auth/register`
-  for the account's own token pair.
+  for the account's own token pair. The browser can be on another machine;
+  no local callback listener is needed. The device code's deadline starts
+  when WorkOS returns it (at most 10 minutes), not when completion is
+  requested. Cancelling stops the device request, polling or registration;
+  repeated completion reuses the same result.
 - **Cline API key** — create one at [app.cline.bot → Settings → API Keys](https://app.cline.bot/dashboard/account)
   and paste it. Sent as a plain Bearer key.
 

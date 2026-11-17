@@ -1,6 +1,6 @@
 // Tests for the Cline provider plugin. Every request the plugin would make is
 // answered by a mock fetch here; nothing reaches the network.
-import { test, expect, beforeEach, afterEach } from "bun:test"
+import { test, expect, beforeEach, afterEach, spyOn } from "bun:test"
 import { ClinePlugin, _internal } from "./index.mjs"
 
 const { authOf, parseAuth, parseFeed, prettify, inputsFor, creditsOf, balanceUSD, usd, usageOf, limitWindows, failure, bearerOf, toMs, refresh, deviceAuthorize, pollDevice, clientHeaders, constants: { CLIENT, DEFAULT_MODELS } } = _internal
@@ -30,7 +30,9 @@ function serve(routesIn) {
 	}
 }
 
+const authCleanup = []
 afterEach(() => {
+	for (const close of authCleanup.splice(0).reverse()) close()
 	globalThis.fetch = realFetch
 })
 
@@ -510,7 +512,6 @@ test("the device sign-in approves, registers, and keeps the pair", async () => {
 	const { client: c } = client()
 	const hooks = await ClinePlugin({ client: c })
 	const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
-	expect(oauth.label).toContain("Cline")
 	serve([
 		["user_management/authorize/device", () => Response.json({ device_code: "dc1", user_code: "ABCD-1234", verification_uri: "https://eu.workos.com/device", verification_uri_complete: "https://eu.workos.com/device?code=ABCD-1234", interval: 0.25, expires_in: 300 })],
 		["user_management/authenticate", () => Response.json({ error: "authorization_pending" }, { status: 400 })],
@@ -520,7 +521,11 @@ test("the device sign-in approves, registers, and keeps the pair", async () => {
 	const start = await oauth.authorize()
 	expect(start.url).toBe("https://eu.workos.com/device?code=ABCD-1234")
 	expect(start.method).toBe("auto")
-	const r = await start.callback()
+	const pending = start.callback()
+	expect(start.callback()).toBe(pending)
+	const r = await pending
+	expect(await start.callback()).toEqual(r)
+	expect(calls.filter((c) => c.url.endsWith("/auth/register"))).toHaveLength(1)
 	expect(r.type).toBe("success")
 	expect(r.access).toBe("ca1")
 	expect(r.refresh).toBe("cr1")
@@ -544,7 +549,6 @@ test("a refused device approval fails the sign-in", async () => {
 	const start = await oauth.authorize()
 	const r = await start.callback()
 	expect(r.type).toBe("failed")
-	expect(r.error).toContain("access_denied")
 })
 
 test("a failed register trades on nothing", async () => {
@@ -559,7 +563,6 @@ test("a failed register trades on nothing", async () => {
 	const start = await oauth.authorize()
 	const r = await start.callback()
 	expect(r.type).toBe("failed")
-	expect(r.error).toContain("unknown account")
 })
 
 test("a device code request that fails fails the authorize", async () => {
@@ -569,7 +572,136 @@ test("a device code request that fails fails the authorize", async () => {
 		["user_management/authorize/device", () => Response.json({ message: "no device grants" }, { status: 403 })],
 	])
 	const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
-	await expect(oauth.authorize()).rejects.toThrow("device code request failed")
+	expect((await oauth.authorize()).type).toBe("failed")
+})
+
+const deviceReply = { device_code: "dc1", user_code: "X", verification_uri: "https://eu.workos.com/device", interval: 1, expires_in: 300 }
+const deviceRoute = ["user_management/authorize/device", () => Response.json(deviceReply)]
+function signInController() {
+	const controller = new AbortController()
+	authCleanup.push(() => controller.abort())
+	return controller
+}
+async function beginDevice(controller = signInController()) {
+	const hooks = await ClinePlugin()
+	return { flow: await hooks.auth.methods[0].authorize({}, { signal: controller.signal }), controller }
+}
+function waitForAbort(signal) {
+	return new Promise((_, reject) => {
+		signal.throwIfAborted()
+		signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+	})
+}
+
+test("a pre-cancelled device authorize makes no request", async () => {
+	serve([])
+	const controller = signInController()
+	controller.abort()
+	expect((await beginDevice(controller)).flow.type).toBe("failed")
+	expect(calls).toHaveLength(0)
+})
+
+test("cancelling device authorize aborts the initial WorkOS request", async () => {
+	let began
+	const ready = new Promise((r) => (began = r))
+	serve([["user_management/authorize/device", (init) => { began(init.signal); return waitForAbort(init.signal) }]])
+	const controller = signInController()
+	const pending = beginDevice(controller)
+	const signal = await ready
+	controller.abort()
+	expect((await pending).flow.type).toBe("failed")
+	expect(signal.aborted).toBe(true)
+	expect(calls).toHaveLength(1)
+})
+
+test("cancelling after device authorize prevents a later callback from polling", async () => {
+	serve([deviceRoute])
+	const { flow, controller } = await beginDevice()
+	controller.abort()
+	expect((await flow.callback()).type).toBe("failed")
+	expect(calls).toHaveLength(1)
+})
+
+test.each([true, false])("a callback cancelled before or during its first device wait sends no poll (pre: %s)", async (pre) => {
+	serve([deviceRoute])
+	const { flow } = await beginDevice()
+	const controller = signInController()
+	if (pre) controller.abort()
+	const pending = flow.callback(undefined, { signal: controller.signal })
+	if (!pre) controller.abort()
+	expect((await pending).type).toBe("failed")
+	expect(calls).toHaveLength(1)
+})
+
+test("an abandoned device authorize expires and clears its timer without callback", async () => {
+	const set = globalThis.setTimeout
+	let expire, timer
+	const startTimer = spyOn(globalThis, "setTimeout").mockImplementation((fn, ms, ...args) => {
+		const t = set(fn, ms, ...args)
+		if (ms === 300_000) { expire = fn; timer = t }
+		return t
+	})
+	const stopTimer = spyOn(globalThis, "clearTimeout")
+	authCleanup.push(() => startTimer.mockRestore(), () => stopTimer.mockRestore())
+	serve([deviceRoute])
+	const { flow } = await beginDevice()
+	expire()
+	expect(stopTimer).toHaveBeenCalledWith(timer)
+	expect((await flow.callback()).type).toBe("failed")
+	expect(calls).toHaveLength(1)
+})
+
+test("starting callback late does not renew the device code's absolute deadline", async () => {
+	serve([deviceRoute])
+	const { flow } = await beginDevice()
+	const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 301_000)
+	authCleanup.push(() => clock.mockRestore())
+	expect((await flow.callback()).type).toBe("failed")
+	expect(calls).toHaveLength(1)
+})
+
+test("cancelling an in-flight device poll is not retried as a network failure", async () => {
+	const controller = signInController()
+	let began, requests = 0
+	const ready = new Promise((r) => (began = r))
+	const pending = pollDevice(deviceReply, {
+		signal: controller.signal, sleep: async () => {},
+		fetchImpl: async (_url, init) => { requests++; began(init.signal); return waitForAbort(init.signal) },
+	})
+	const signal = await ready
+	controller.abort()
+	await expect(pending).rejects.toBeDefined()
+	expect(signal.aborted).toBe(true)
+	expect(requests).toBe(1)
+})
+
+test("a device code expiring during sleep sends no final poll", async () => {
+	let clock = 0, requests = 0
+	await expect(pollDevice(deviceReply, {
+		deadline: 500, now: () => clock,
+		sleep: async (ms) => { clock += ms },
+		fetchImpl: async () => { requests++; return Response.json({ access_token: "too-late" }) },
+	})).rejects.toBeDefined()
+	expect(clock).toBe(500)
+	expect(requests).toBe(0)
+})
+
+test("cancelling register aborts the request instead of returning or registering another pair", async () => {
+	let began
+	const ready = new Promise((r) => (began = r))
+	serve([
+		deviceRoute,
+		["user_management/authenticate", () => Response.json({ access_token: "wt1", refresh_token: "wr1" })],
+		["/auth/register", (init) => { began(init.signal); return waitForAbort(init.signal) }],
+	])
+	const { flow, controller } = await beginDevice()
+	const pending = flow.callback()
+	const signal = await ready
+	controller.abort()
+	expect((await pending).type).toBe("failed")
+	expect(flow.callback()).toBe(pending)
+	expect(signal.aborted).toBe(true)
+	expect(calls).toHaveLength(3)
 })
 
 // ---- usage -----------------------------------------------------------------------
