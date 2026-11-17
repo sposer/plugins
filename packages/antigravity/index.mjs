@@ -2129,27 +2129,13 @@ async function signIn(_inputs, { signal } = {}, manual = false) {
 
 // imported is the first account of a pasted export: a JSON account or
 // list of them (Antigravity tools' exports: refresh_token, project_id,
-// email, perhaps under token or accounts), sub2api Antigravity OAuth
-// accounts, or bare refresh tokens, one a line
+// email, perhaps under token or accounts), or bare refresh tokens, one a line
 function imported(text) {
   text = String(text ?? "").trim()
   const j = parse(text)
   const found = []
-  const take = (o, sub2api = false) => {
+  const take = (o) => {
     if (!isObj(o)) return
-    if (o.type === "sub2api-data") {
-      if (o.version !== undefined && o.version !== 1) throw new Error("this sub2api export version isn't supported")
-      if (Array.isArray(o.accounts)) o.accounts.forEach((a) => take(a, true))
-      return
-    }
-    // decision: recognize sub2api by its platform and OAuth type; not any
-    // credentials object because other providers export refresh tokens too.
-    if (sub2api || "platform" in o || "credentials" in o) {
-      if (o.platform !== "antigravity" || o.type !== "oauth" || !isObj(o.credentials)) return
-      const t = o.credentials
-      if (typeof t.refresh_token === "string" && t.refresh_token.trim()) found.push({ rt: t.refresh_token.trim(), project: t.project_id ?? "", email: t.email ?? "" })
-      return
-    }
     if (typeof o.type === "string" && o.type && o.type.toLowerCase() !== "antigravity") throw new Error(`this is a ${o.type} account, not Antigravity's`)
     const t = isObj(o.token) ? o.token : o
     const rt = t.refresh_token ?? t.refreshToken ?? o.refresh_token ?? o.refreshToken

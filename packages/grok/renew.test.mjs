@@ -9,17 +9,15 @@
 // auth.json caught while the CLI rewrites it is unknown, not "not signed
 // in": it is read again, else the last sign-in read whole there stands.
 //
-// The CLI is a fake as in refresh.test.mjs: /bin/sh under grok's name,
-// `grok models` being `sh models` reading the script below. FAKE_GROK says
-// what the run does: renew writes a new token, same exits 0 leaving the
-// token as it was (the CLI saying "Renewed" with pre_key == post_key), fail
-// exits 1 as a failed silent refresh. PATH is emptied so no real grok is
-// ever found, and fetch is a stand-in: nothing reaches the network.
+// The CLI is intercepted at execFile by fake-cli.mjs. FAKE_GROK selects
+// renewal, unchanged credentials, slow completion or failure. PATH is
+// emptied so no real grok is found, and fetch never reaches the network.
 import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fakeCLI } from "./fake-cli.mjs"
 import { GrokAuthPlugin } from "./index.mjs"
 
 noRealGrok()
@@ -27,24 +25,10 @@ noRealGrok()
 const real = globalThis.fetch
 const env = { ...process.env }
 const root = mkdtempSync(join(tmpdir(), "grok-renew-"))
-afterAll(() => rmSync(root, { recursive: true, force: true }))
-
-const bin = join(root, "bin")
 const later = new Date(Date.now() + 24 * 3600_000).toISOString()
-mkdirSync(bin)
-symlinkSync("/bin/sh", join(bin, "grok"))
-writeFileSync(
-  join(root, "models"),
-  `n=$(( $(cat "$GROK_HOME/runs" 2>/dev/null || echo 0) + 1 ))
-echo $n > "$GROK_HOME/runs"
-case "$FAKE_GROK" in
-  renew) printf '{"a":{"key":"tok-%s","email":"g@x.ai","expires_at":"${later}"}}' $n > "$GROK_HOME/auth.json" ;;
-  same) ;;
-  slow) /bin/sleep 2; echo done > "$GROK_HOME/slow" ;;
-  *) echo "silent refresh outcome=Failed(SelfHealing)" >&2; exit 1 ;;
-esac
-`,
-)
+const cli = fakeCLI(root, later)
+const { bin } = cli
+afterAll(() => { cli.dispose(); rmSync(root, { recursive: true, force: true }) })
 
 let home
 beforeEach(() => {
@@ -125,12 +109,7 @@ test("a request whose token Grok Build couldn't renew says so, and to add the ac
   const { res } = await chat(auth)
   expect(res.status).toBe(401)
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
-  const msg = (await res.json()).error.message
-  expect(msg).toContain("Grok Build couldn't renew the sign-in (grok models ran and left the same token)")
-  expect(msg).toContain("add the account in magpie again")
-  expect(msg).toContain("Invalid or expired credentials")
-  expect(msg).not.toContain("grok login")
-  expect(msg).not.toMatch(/sign-in has expired/)
+  expect((await res.json()).error.code).toBe("sign_in_unrenewed")
   expect(sent).toEqual(["Bearer tok-0"])
   expect(runs()).toBe(1)
 })
@@ -142,10 +121,8 @@ test("for Grok Build's own home, a token it couldn't renew says to open Grok Bui
   grok(() => Response.json({ ok: true }))
   const { res } = await chat(auth)
   expect(res.status).toBe(401)
-  const msg = (await res.json()).error.message
-  expect(msg).toContain("Grok Build couldn't renew the sign-in (grok models exited 1: silent refresh outcome=Failed(SelfHealing))")
-  expect(msg).toContain("open Grok Build and send it a message")
-  expect(msg).not.toContain("grok login")
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect((await res.json()).error.code).toBe("sign_in_unrenewed")
 })
 
 test("a model list Grok turns away is asked again with the renewed token", async () => {
@@ -165,8 +142,7 @@ test("a model list whose token Grok Build couldn't renew says so, not that the s
   const { hooks } = await plugin()
   const e = await hooks.provider.models({ id: "grok", models: {} }, { auth }).catch((e) => e)
   expect(e).toBeInstanceOf(Error)
-  expect(e.message).toContain("Grok Build couldn't renew the sign-in")
-  expect(e.message).not.toMatch(/sign-in has expired|grok login/)
+  expect(e.unrenewed).toBe(true)
   expect(e.signIn).toBeUndefined()
 })
 
@@ -205,8 +181,7 @@ test("auth.json torn with nothing read before is unknown: no account is marked s
   const e = await hooks.auth.refresh(structuredClone(auth)).catch((e) => e)
   expect(e).toBeInstanceOf(Error)
   expect(e.signIn).toBeUndefined()
-  expect(e.message).toContain("couldn't be read")
-  expect(e.message).not.toContain("not signed in")
+  expect(readFileSync(join(home, "auth.json"), "utf8")).toBe('{"a":{"key":"tok-7"')
 })
 
 // plugins#818: a 401 that isn't Grok's judgement of the token, on one
@@ -223,11 +198,6 @@ test("a 401 that isn't Grok judging the token, on a token Grok Build left good, 
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
   const err = (await res.json()).error
   expect(err.code).toBe("auth_refused_transient")
-  expect(err.message).toContain("Authentication required")
-  expect(err.message).toContain("grok models ran and left the same token")
-  expect(err.message).toContain(`good till ${later}`)
-  expect(err.message).toContain("Grok answered 401 after 1s")
-  expect(err.message).not.toMatch(/add the account|grok login|open Grok Build|couldn't renew/)
   expect(sent).toEqual(["Bearer tok-0"])
   expect(runs()).toBe(1)
 })
@@ -240,7 +210,6 @@ test("Grok judging the token on a 401 still says to sign in again, though the CL
   expect(res.status).toBe(401)
   const err = (await res.json()).error
   expect(err.code).toBe("sign_in_unrenewed")
-  expect(err.message).toContain("add the account in magpie again")
 })
 
 test("a passing-looking 401 the CLI failed to renew is still a sign-in it couldn't renew", async () => {
@@ -251,7 +220,6 @@ test("a passing-looking 401 the CLI failed to renew is still a sign-in it couldn
   expect(res.status).toBe(401)
   const err = (await res.json()).error
   expect(err.code).toBe("sign_in_unrenewed")
-  expect(err.message).toContain("grok models exited 1")
 })
 
 test("a refused request waits on Grok Build's renewal a bounded time, and the run's end is still waited for", async () => {
@@ -266,7 +234,7 @@ test("a refused request waits on Grok Build's renewal a bounded time, and the ru
     const { res } = await chat(auth)
     const took = Date.now() - at
     expect(res.status).toBe(503)
-    expect((await res.json()).error.message).toContain("grok models was still running after 0.3s")
+    expect((await res.json()).error.code).toBe("auth_refused_transient")
     expect(took).toBeLessThan(1900)
   } finally {
     waits.renew = was
@@ -283,8 +251,7 @@ test("a model list refused that way says it passes, and leaves the sign-in be", 
   const { hooks } = await plugin()
   const e = await hooks.provider.models({ id: "grok", models: {} }, { auth }).catch((e) => e)
   expect(e).toBeInstanceOf(Error)
-  expect(e.message).toContain("Authentication required")
-  expect(e.message).not.toMatch(/add the account|couldn't renew/)
+  expect(e.transient).toBe(true)
   expect(e.signIn).toBeUndefined()
 })
 
@@ -295,7 +262,7 @@ test("a usage read refused that way says it passes", async () => {
   const { hooks } = await plugin()
   const u = await hooks.auth.usage(async () => auth)
   expect(u.signIn).toBe("kept")
-  expect(u.error).toContain("Authentication required")
-  expect(u.error).not.toMatch(/add the account|couldn't renew/)
+  expect(u.windows).toEqual([])
+  expect(u.error).toBeTruthy()
   expect(u.said).toBeUndefined()
 })

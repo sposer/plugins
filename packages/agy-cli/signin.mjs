@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
 import fs from "node:fs"
-import { currentHome, tokenFile } from "./account.mjs"
+import { adcFile, currentHome, tokenFile } from "./account.mjs"
 
 // What agy's own sign-in looks like on this computer, read without running
 // agy. agy keeps its Google token in the system keyring through go-keyring,
@@ -170,7 +170,15 @@ export async function storedToken(opts) {
     const v = await readStoredValue(opts)
     if (!("raw" in v)) return null
     const stored = decodeStored(v.raw)
-    return stored?.token && typeof stored.token === "object" ? stored : null
+    if (!stored?.token || typeof stored.token !== "object") return null
+    const home = opts?.home === undefined ? currentHome() : opts.home
+    if (home && fs.existsSync(adcFile(home))) {
+      const adc = JSON.parse(await fs.promises.readFile(adcFile(home), "utf8"))
+      // Direct quota fallback renews with the same native ADC client, never
+      // with the consumer client's hardcoded defaults.
+      return { ...stored, auth_method: "adc", oauth: adc, token: { ...stored.token, refresh_token: adc.refresh_token } }
+    }
+    return stored
   } catch {
     return null
   }

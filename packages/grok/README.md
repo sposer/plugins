@@ -3,7 +3,8 @@
 Grok with a SuperGrok or X Premium+ subscription, through the sign-in of
 xAI's [Grok Build CLI](https://x.ai/cli). Provider id: `grok`.
 
-It needs Grok Build installed:
+Device-code and OAuth logins work without an installed CLI. Using Grok
+Build's current sign-in or importing CPA credentials needs Grok Build:
 
 ```sh
 curl -fsSL https://x.ai/cli/install.sh | bash          # macOS, Linux
@@ -29,99 +30,113 @@ translations are refused.
 
 ## Sign in
 
-- **Sign in with Grok Build (device code)** runs `grok login --device-auth`
-  and opens the page it prints. Approve the sign-in there, and the CLI
-  finishes it.
-  - If the CLI isn't signed in yet, the sign-in goes to the CLI's own home
-    (`GROK_HOME`, else `~/.grok`), as if you had run `grok login`.
-  - If it is signed in, the sign-in goes to a home of this plugin's,
-    `$XDG_CONFIG_HOME/opencode-grok-auth/<random>` (else under
-    `~/.config`). Grok Build's own sign-in stays as it is.
-  - The account is told apart by its email, else its xAI user id (an
-    account signed in through X can have no email). `GROK_AUTH_PATH` is
-    left out of the CLI's run, so the sign-in lands in that home.
-  - When the CLI finishes but leaves no sign-in there, the failure says
-    which file it read and what it found.
-  - The plugin waits 30 seconds for a link and up to 10 minutes for the
-    interaction, including its callback. The latter is a local wait limit,
-    not xAI's device-code expiry: the CLI owns that expiry and doesn't
-    expose it with the printed link. Cancel or start again if needed.
-    Cancellation, failure or timeout stops the CLI and removes only a new,
-    unsaved private home. The CLI's existing home is left in place, and a
-    successful account's home is kept, including on repeated callbacks.
-- **Use Grok Build's current sign-in** takes the account the CLI is
-  signed in to, with nothing to approve.
-- **Import CPA / sub2api Grok account JSON** accepts a file path or pasted
-  JSON for one account. CPA's enabled xAI OAuth account files
-  (`~/.cli-proxy-api/xai-<email>.json`) remain supported. sub2api accounts
-  must explicitly name `platform: "grok"` and `type: "oauth"`, with their
-  OAuth fields under `credentials`; `expires_at` is an RFC3339 string,
-  not Unix seconds. An X sign-in can omit email when its user id or token
-  subject identifies the account.
-  - In magpie, **Import accounts from a file…** accepts multiple JSON files
-    or pasted JSON: individual accounts, lists, or sub2api exports with an
-    `accounts` list (`type: "sub2api-data"`, `version: 1`, when present).
-    Other platforms and non-OAuth accounts are skipped; malformed Grok
-    credentials report an error. The single-account method directs exports
-    containing several Grok accounts to this bulk import.
-  - Imports require the Grok Build xAI client
-    (`b1a00492-073a-47ea-816f-4c329264a828`) and its token issuer/audience.
-    sub2api can configure another client id; those accounts can't be
-    imported for this CLI. Grok Build remains responsible for renewal.
-  - Duplicate accounts make one home. Existing private or CLI sign-ins are
-    reused without rewriting them. Cancelling a bulk import removes all
-    homes that batch created before returning its accounts.
-  - Stop using the imported accounts in CPA or sub2api before continuing:
-    both clients rotate the same refresh token, so they must not refresh
-    the account concurrently. Import reads the source without changing its
-    files, disabling accounts or contacting xAI.
+All login links are opened manually. The plugin starts no browser or local
+callback listener and never runs the CLI's login command.
+
+- **Sign in with Grok Build (device code)** requests a device code directly
+  from xAI. Open the displayed link yourself and approve the displayed
+  code. Keep the login open while the plugin polls for approval.
+- **Use Grok Build's current sign-in** reads the CLI's existing account
+  (`GROK_HOME`, else `~/.grok`), with nothing to approve. No credential
+  conversion or refresh-owner change is performed.
+- **Import CPA xAI account JSON** accepts a path or pasted JSON for an
+  enabled CPA xAI OAuth account (`~/.cli-proxy-api/xai-<email>.json`). In
+  magpie, **Import accounts from a file…** also accepts multiple files and
+  lists. Other platforms and non-OAuth accounts are skipped; invalid CPA
+  credentials report an error. CPA imports require Grok Build's public
+  client and its token issuer/audience. Duplicate identities reuse their
+  existing home without rewriting it. Stop using the account in CPA first:
+  both clients rotate the same refresh token. Import leaves source files
+  and accounts unchanged and does not contact xAI.
+- **OAuth authorization code (manual link and callback)** accepts OAuth
+  client configuration, then shows an authorization link with PKCE. Open
+  it yourself, authorize, and paste either the full callback URL (including
+  `state`) or the authorization code. A full callback must match the
+  configured redirect and this attempt's state. A bare code is exchanged
+  with this attempt's PKCE verifier. A loopback page may fail to load:
+  copy its callback URL from the address bar back into the login.
+- **OAuth account fields (refresh token / access token)** accepts the
+  OAuth configuration and an existing `refresh_token` or `access_token`.
+  A refresh token takes precedence and is validated by an actual refresh
+  grant, retaining its replacement. An access-only login needs a future
+  RFC3339 `expires_at` or a positive `expires_in` in seconds; `token_type`
+  defaults to `Bearer`. It remains access-only and needs a new login when
+  expired or rejected. Tokens are validated against Grok's `/v1/user`
+  before a new account is saved; identity comes from that endpoint, not
+  unverified JWT claims. Stop refreshing an entered token in its previous
+  client before continuing.
+
+### OAuth configuration
+
+Both OAuth methods offer the same fields:
+
+| Field | Default / behavior |
+| --- | --- |
+| `client_id` | Grok Build's public client, `b1a00492-073a-47ea-816f-4c329264a828` |
+| `client_secret` | Empty for a public client; saved with the account when supplied |
+| Client authentication | Automatic: `none` without a secret, `client_secret_post` with one; explicit `client_secret_basic` and `client_secret_post` are supported |
+| `redirect_uri` | `http://127.0.0.1:56121/callback`; use a redirect registered for your client, HTTPS or HTTP loopback |
+| `scope` | `openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write` |
+
+The issuer is `https://auth.x.ai`. `grok-cli:access` is required for this
+provider's subscription backend. Custom clients and scopes must be enabled
+for that backend by xAI; entering client fields does not grant subscription
+access. Scopes without `openid` use OAuth without requiring an ID token.
+
+Each interaction has a 10-minute local limit; device login also honors the
+shorter device-code expiry. Cancellation, timeout or failure removes only
+new, unsaved homes and releases timers and listeners. Repeated callbacks
+return the same completed result. Refresh-token rotation is an external
+side effect: if xAI returns a successor for an already-saved plugin OAuth
+account, it is retained in that account's home even when the UI is cancelled
+immediately afterwards. The old token is not restored.
 
 ## Where the sign-in is kept
 
-The CLI keeps the sign-in in its home, as `auth.json`. OpenCode (or
-magpie) keeps where that home is, the token and its expiry. Importing a CPA
-or sub2api account writes only its translated xAI OAuth fields to a private
-home owned by this plugin; source files are left unchanged.
+OpenCode (or magpie) stores the account's home path, access token and expiry.
+New device/code/account-fields logins always use this plugin's private
+`$XDG_CONFIG_HOME/opencode-grok-auth/<random>` home (else under
+`~/.config`), never the native CLI home. Re-signing the same plugin OAuth
+identity updates its existing private home. A matching existing native or
+CPA identity stays unchanged and does not absorb the new OAuth login.
 
-The plugin reads `auth.json`; Grok Build refreshes the token, which changes
-each time. The plugin runs `grok models` in that home, so the CLI renews
-it, then reads it again:
+New OAuth homes contain native-format `auth.json`, keyed by
+`<issuer>::<client_id>`, and `config.toml` selecting that client and scopes.
+`magpie_oauth` in the credential stores the configuration needed for the
+plugin's OAuth refresh, including any client secret. Keep these homes under
+the plugin's management: Grok Build's public-client refresh does not send
+client secrets. Existing CLI and CPA credentials are neither migrated nor
+assigned this new refresh owner.
 
-- magpie renews the token 5 minutes before it ends, through the plugin's
-  `auth.refresh`, once for the account and before its requests, models
-  and usage need it. magpie saves what the CLI gave.
-- OpenCode doesn't call that hook: there the token is renewed when it is
-  5 minutes from expiring, before a request.
-- The CLI runs once for a home at a time: a request or renewal that
-  comes while it runs waits for it and reads what it gave. A token the
-  CLI already renewed is taken as it is.
-- Grok can turn a token away before its `expires_at`. A request, model
-  list or usage read that gets 401 has the CLI renew the token and asks
-  once more with the new one.
-- When the CLI's run leaves the token as it was, the 401 or error says
-  Grok Build couldn't renew the sign-in, with what the CLI said. For Grok
-  Build's own home ("Use Grok Build's current sign-in") opening Grok Build
-  and sending it a message renews it. For a home of the plugin's (a second
-  account, an imported one), opening Grok Build doesn't touch it: add the
-  account in magpie again.
-- Not every 401 is Grok judging the token. A token it doesn't take is
-  answered at once with `Invalid or expired credentials (…)`. Another
-  401, such as `Authentication required` after a minute or more, on a
-  token the CLI left as it was and not yet ended, has passed by itself
-  within minutes. Unless the CLI failed renewing it, that is a 503 with
-  `Retry-After: 60` that keeps the sign-in and says how long Grok took:
-  magpie rests the account a moment and asks the next one. It never says
-  to sign in again.
-- A request, model list or usage read turned away waits on the CLI's
-  renewal 15 seconds at most. The run goes on, and the next one to ask
-  takes what it gave.
-- When the CLI no longer holds a sign-in in that home (`grok logout`),
-  the account has to be signed in again. When it couldn't renew a token
-  that has ended, magpie tries again later.
-- An `auth.json` that is empty or not JSON is most likely one the CLI is
-  writing: it is read again for about half a second, then the last sign-in
-  read whole there stands, as the CLI itself keeps its previous one. It is
-  never taken as signed out. The plugin takes no `auth.json.lock`.
+New OAuth logins use `oauth4webapi` for device/code exchanges and refresh.
+The [xAI discovery document](https://auth.x.ai/.well-known/openid-configuration)
+and [Grok Build's native auth model](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-login/src/model.rs)
+own the upstream contracts. The official Grok Build 1.0.88 Windows binary
+was checked with synthetic credentials and loopback services: it consumed
+a new OAuth home's native files and custom client for `grok models`.
+
+### Renewal
+
+- magpie calls `auth.refresh` 5 minutes before expiry. OpenCode instead
+  renews before a request. Requests, model lists and usage reads share one
+  refresh flight per home and retry once after a token rejection.
+- New OAuth accounts refresh through the configured xAI client, with a
+  30-second request deadline. The plugin persists any rotated token in the
+  same native credential and returns the new access token and expiry.
+  A failed grant leaves the saved credential intact and can be retried.
+- Existing CLI and CPA accounts keep their original path: the plugin runs
+  `grok models` in the account's home and reads the resulting `auth.json`.
+  `GROK_AUTH_PATH` is excluded from that run so it targets that home. A
+  refused request waits at most 15 seconds for this CLI refresh; the run
+  continues, and later callers read its result.
+- If a CLI refresh leaves the token unchanged, the error includes what
+  Grok Build reported. Renew the CLI's own account in Grok Build; for a
+  private legacy or imported account, add it in magpie again. A transient
+  401 on a still-valid token that the CLI left unchanged remains a 503
+  with `Retry-After: 60`, keeping the account rather than requesting login.
+- An empty or invalid `auth.json` is retried for about half a second, then
+  the last complete read is used if available. It is not treated as a
+  logout. The plugin takes no `auth.json.lock`.
 
 ## Requests
 
@@ -133,7 +148,7 @@ API (`@ai-sdk/openai`), signed as the CLI signs them:
 - `x-grok-client-identifier: grok-shell`
 - `x-grok-client-mode: headless`
 - `x-grok-client-version` and `User-Agent: grok-shell/<version> (<os>; <arch>)`.
-  The version is 1.0.41, or the installed CLI's if it is newer.
+  The version is 1.0.88, or the installed CLI's if it is newer.
 - `x-grok-model-override`: the request's model. A window suffix
   (`grok-4.7@500k`) is the plain model (`grok-4.7`) here and in the body.
 - `x-grok-context-window`: the token count a suffixed model names

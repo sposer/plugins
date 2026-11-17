@@ -1,13 +1,9 @@
-// Grok (SuperGrok / X Premium+) through the Grok Build CLI's own sign-in.
-//
-// The CLI (https://x.ai/cli) signs in with a device code and keeps the
-// sign-in in its home (GROK_HOME, else ~/.grok) as auth.json. This plugin
-// only reads that file: the CLI refreshes the token, which changes each
-// time, so a token about to expire is renewed by running the CLI there
-// (`grok models`), never by the plugin itself. Requests go to the CLI's
-// backend, which speaks OpenAI's Responses API, signed as the CLI signs
-// them.
-import { spawn, execFile } from "node:child_process"
+// Grok (SuperGrok / X Premium+) through Grok Build's subscription backend.
+// New device/code/token-field logins use oauth.mjs and private native-format
+// homes. Existing CLI/CPA accounts retain their CLI-owned refresh path.
+// Requests use the CLI's Responses API and signing contract.
+import { execFile } from "node:child_process"
+import * as grokOAuth from "./oauth.mjs"
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path"
@@ -18,15 +14,10 @@ const PROVIDER = "grok"
 const BASE = "https://cli-chat-proxy.grok.com/v1"
 const CLIENT_VERSION = "1.0.88" // https://x.ai/cli/stable
 const CPA_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-const CPA_SCOPE = `https://auth.x.ai::${CPA_CLIENT_ID}`
 const LOOP_CHECKS = [["x-grok-doom-loop-check", "1024"], ["x-grok-exact-repetition-check", "64"]]
 const REFRESH_MARGIN = 5 * 60 * 1000 // a token this close to its end is renewed before a request
 const LEAD_MS = REFRESH_MARGIN // and this close, magpie renews it ahead of time (auth.refresh)
-const LINK_WAIT = 30 * 1000
-// A local interaction deadline, not xAI's device-code expiry: Grok Build
-// owns that expiry and doesn't expose it with the printed link.
 const LOGIN_WAIT = 10 * 60 * 1000
-const LOGIN_OUTPUT = 8192
 // waits.renew is how long a request, model list or usage read Grok turned
 // away waits on Grok Build's renewal before it gives up on it: the run
 // goes on, and whoever asks next takes what it gave (plugins#818)
@@ -51,14 +42,6 @@ const TOOLS = new Set(["function", "web_search", "x_search", "image_generation",
   "code_execution", "code_interpreter", "mcp", "shell", "tool_search"])
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
-const LINK = /https:\/\/\S+/
-
-// linkIn is the page a line of `grok login` gives to open, "" for none: a
-// line saying it failed names the endpoint it couldn't reach (`Error: error
-// sending request for url (https://auth.x.ai/oauth2/device/code): …`),
-// which is no page to open.
-const linkIn = (line) => (/\berror\b/i.test(line) ? "" : (line.match(LINK)?.[0] ?? ""))
-
 // ---- the CLI ------------------------------------------------------------------
 
 // cliHome is where the CLI keeps its own sign-in and settings.
@@ -164,7 +147,7 @@ function look(home) {
       const email = typeof c.email === "string" ? c.email : ""
       const sub = cpaClaims(c.key)?.sub
       const user = (typeof c.user_id === "string" && c.user_id) || (typeof sub === "string" ? sub : "")
-      const got = { key: c.key, email, user, who: email || user, expires: Number.isFinite(t) ? t : 0, issuer: c.oidc_issuer ?? "" }
+      const got = { key: c.key, email, user, who: email || user, expires: Number.isFinite(t) ? t : 0, issuer: c.oidc_issuer ?? "", ...(c.magpie_oauth ? { oauth: c.magpie_oauth, native: c, scope: k } : {}) }
       lastGood.set(home, got)
       return { c: got, why: "" }
     }
@@ -302,16 +285,38 @@ function within(p, ms) {
 let refreshing = Promise.resolve()
 const renewing = new Map()
 
-// renew has the CLI renew the sign-in in home: a `grok models` there renews
-// it as any use of the CLI does.
-function renew(exe, home) {
+// decision: keep the OAuth client's refresh configuration beside its native
+// credential; not delegate configured clients to grok models because Grok
+// Build's public-client refresh cannot send client_secret_basic/post. Existing
+// CLI/CPA homes retain their original owner. Each home has one refresh flight.
+function renew(exe, home, c) {
   let r = renewing.get(home)
   if (!r) {
-    r = refreshing.then(() => run(exe, ["models"], { cwd: dirname(home), env: envFor(home) })).finally(() => renewing.delete(home))
-    refreshing = r.catch(() => {})
+    if (c?.oauth) r = renewOAuth(home, c)
+    else {
+      r = refreshing.then(() => run(exe, ["models"], { cwd: dirname(home), env: envFor(home) }))
+      refreshing = r.catch(() => {})
+    }
+    r = r.finally(() => renewing.delete(home))
     renewing.set(home, r)
   }
   return r
+}
+
+async function renewOAuth(home, c) {
+  if (!c.native.refresh_token) throw new Error("This access-only Grok account cannot refresh; enter a new access token or refresh token in the OAuth account-fields login")
+  const abort = new AbortController()
+  const timer = setTimeout(() => abort.abort(new Error("Grok OAuth refresh timed out")), 30_000)
+  try {
+    const tokens = await grokOAuth.refresh(c.oauth, c.native.refresh_token, abort.signal)
+    const auth = await grokOAuth.nativeAuth(c.oauth, tokens, validateAccess, undefined, c.native)
+    const file = join(home, "auth.json")
+    const all = JSON.parse(readFileSync(file, "utf8"))
+    all[c.scope] = auth
+    writeFileSync(file, JSON.stringify(all, null, 2), { mode: 0o600 })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // token is the CLI's sign-in in home with a token still good. One about to
@@ -328,6 +333,13 @@ async function token(home, rejected = false, said) {
   const exe = executable()
   const refused = !!c && (rejected === true || (typeof rejected === "string" && c.key === rejected))
   let r
+  if (c?.oauth) {
+    if (refused || (c.native.refresh_token && c.expires - Date.now() < REFRESH_MARGIN) || c.expires <= Date.now()) {
+      await renew(exe, home, c)
+      c = await credential(home)
+    }
+    return c
+  }
   if (c && exe && (refused || c.expires - Date.now() < REFRESH_MARGIN)) {
     const was = c.key
     r = refused ? await within(renew(exe, home), waits.renew) : await renew(exe, home)
@@ -642,16 +654,6 @@ function modelOf(id) {
 
 // ---- sign-in ------------------------------------------------------------------
 
-// opensPage is whether `grok login --device-auth` opens its page in the
-// browser itself, which it does wherever it can: on macOS (NSWorkspace) and
-// Windows (ShellExecute) always, with nothing to turn it off; on Linux and
-// the BSDs through $BROWSER, else xdg-open where a display is. There it is
-// given a $BROWSER that opens nothing, and the one who asked (magpie, which
-// knows where the user's browser is) opens it; here the sign-in says the
-// page is open already, so it isn't opened a second time (andyfmyth on X:
-// "每次都会弹两次验证").
-const opensPage = () => process.platform === "darwin" || process.platform === "win32"
-
 function newHome() {
   const home = join(ownHomes(), randomBytes(9).toString("base64url").replace(/[-_]/g, "").toLowerCase())
   mkdirSync(home, { recursive: true, mode: 0o700 })
@@ -664,175 +666,132 @@ function dropHome(home) {
   rmSync(home, { recursive: true, force: true })
 }
 
-// DeviceLogin owns the command, its waits and its not-yet-saved home, even
-// when the caller never asks for the callback.
-// decision: bound the native CLI interaction locally; not parse an expiry
-// from its prose because the printed link has no device-code lifetime;
-// revisit when Grok Build exposes a machine-readable device expiry.
-class DeviceLogin {
-  constructor(exe, home, own, signal) {
-    this.home = home
-    this.own = own
-    this.buf = ""
-    this.last = ""
+// One bounded interaction, with no browser, child process or callback server.
+// Homes are allocated only by ImportBatch after protocol + proxy validation.
+class OAuthLogin {
+  constructor(signal) {
+    this.abort = new AbortController()
     this.watches = new Map()
-    this.readAbort = new AbortController()
-    this.link = new Promise((ok) => (this.found = ok))
-    this.done = new Promise((ok) => (this.ended = ok))
-    this.stopped = new Promise((ok) => (this.reaped = ok))
-    this.linkTimer = setTimeout(() => this.fail(this.noLink()), LINK_WAIT)
-    this.deadline = setTimeout(() => this.fail(new Error("Grok Build sign-in exceeded this plugin's 10-minute wait; start the sign-in again")), LOGIN_WAIT)
-    const env = envFor(home)
-    if (!opensPage()) env.BROWSER = "true"
-    this.onData = (chunk) => {
-      this.buf += chunk.toString()
-      let i
-      while ((i = this.buf.indexOf("\n")) >= 0) {
-        this.line(this.buf.slice(0, i))
-        this.buf = this.buf.slice(i + 1)
-      }
-      this.buf = this.buf.slice(-LOGIN_OUTPUT)
-    }
-    try {
-      this.child = spawn(exe, ["login", "--device-auth"], { cwd: homedir(), env, stdio: ["ignore", "pipe", "pipe"] })
-      this.child.stdout.on("data", this.onData)
-      this.child.stderr.on("data", this.onData)
-      this.onError = (e) => {
-        this.last = e.message
-        this.fail(this.hasLink ? e : this.noLink())
-      }
-      this.child.once("error", this.onError)
-      this.onExit = () => { this.exited = true; this.reaped() }
-      this.child.once("exit", this.onExit)
-      this.child.once("close", (code) => {
-        this.exited = true
-        this.child.removeListener("error", this.onError)
-        this.child.removeListener("exit", this.onExit)
-        this.child.stdout.removeListener("data", this.onData)
-        this.child.stderr.removeListener("data", this.onData)
-        this.line(this.buf)
-        this.buf = ""
-        this.reaped()
-        if (!this.hasLink) this.fail(this.noLink())
-        else if (code !== 0) this.fail(new Error(this.last || "grok login didn't finish"))
-        else this.ended({ ok: true })
-      })
-      this.watch(signal)
-    } catch (e) {
-      this.exited = true
-      this.reaped()
-      this.last = e.message
-      this.fail(this.noLink())
-    }
-  }
-
-  line(text) {
-    const line = text.replace(ANSI, "").trim().slice(-LOGIN_OUTPUT)
-    if (line) this.last = line
-    const url = !this.failure && linkIn(line)
-    if (url && !this.hasLink) {
-      this.hasLink = true
-      clearTimeout(this.linkTimer)
-      this.found(url)
-    }
-  }
-
-  noLink() {
-    // Keep the CLI's own diagnosis, including proxy/network failures.
-    return new Error(this.last ? `grok login gave no link to open: ${this.last}` : "grok login gave no link to open and said nothing: can this machine reach auth.x.ai? Set a proxy in magpie's Settings if it needs one")
+    this.deadline = setTimeout(() => this.cancel(new Error("Grok sign-in timed out; start again")), LOGIN_WAIT)
+    this.deadline.unref?.()
+    this.watch(signal)
   }
 
   watch(signal) {
-    if (!signal || this.committed || this.failure || this.watches.has(signal)) return
-    const abort = () => this.fail(signal.reason ?? new Error("Grok Build sign-in was cancelled"))
+    if (!signal || this.settled || this.watches.has(signal)) return
+    const abort = () => this.cancel(signal.reason)
     this.watches.set(signal, abort)
     signal.addEventListener("abort", abort, { once: true })
     if (signal.aborted) abort()
   }
 
   clear() {
-    clearTimeout(this.linkTimer)
     clearTimeout(this.deadline)
     for (const [signal, abort] of this.watches) signal.removeEventListener("abort", abort)
     this.watches.clear()
   }
 
-  fail(error) {
-    if (this.committed || this.failure) return
-    this.failure = error instanceof Error ? error : new Error(String(error ?? "Grok Build sign-in was cancelled"))
+  cancel(reason) {
+    if (this.settled) return
+    this.abort.abort(reason ?? new Error("Grok sign-in cancelled"))
     this.clear()
-    this.readAbort.abort(this.failure)
-    this.found("")
-    this.ended({ ok: false })
-    // Reap the writer before deleting its home: otherwise a late write can
-    // recreate a cancelled account. SIGKILL also bounds a CLI ignoring TERM.
-    // Close pipes too: a browser inheriting them must not hold cleanup open
-    // after the login process exits.
-    if (this.child) {
-      for (const stream of [this.child.stdout, this.child.stderr]) {
-        stream.removeListener("data", this.onData)
-        stream.destroy?.()
-      }
-      if (!this.exited) this.child.kill("SIGKILL")
-    }
-    this.cleanup = this.stopped.then(() => {
-      if (this.own) dropHome(this.home)
-    }).catch((e) => { this.failure = new Error(`${this.failure?.message ?? this.failure}; home cleanup failed: ${e.message}`) })
   }
 
-  finish(signal) {
-    // A repeated callback shares the result; it can't cancel a saved home.
+  finish(work, signal) {
+    if (this.result) return this.result
     this.watch(signal)
-    this.result ??= this.complete()
+    this.result = (async () => {
+      try {
+        this.abort.signal.throwIfAborted()
+        const batch = new ImportBatch(this.abort.signal)
+        await batch.existing()
+        const auth = await work(this.abort.signal, batch)
+        this.abort.signal.throwIfAborted()
+        const [result] = await batch.run([{ auth }])
+        return result
+      } catch (error) {
+        return { type: "failed", error: error.message ?? String(error) }
+      } finally {
+        this.settled = true
+        this.clear()
+      }
+    })()
     return this.result
   }
-
-  async complete() {
-    try {
-      const r = await this.done
-      if (!r.ok || this.failure) throw this.failure
-      const { c, why } = await read(this.home, this.readAbort.signal)
-      if (this.failure) throw this.failure
-      if (!c || (this.own && !c.who)) {
-        const said = this.last ? ` (it said "${this.last}")` : ""
-        throw new Error(!c
-          ? `grok login finished${said}, but left no sign-in where this plugin reads it: ${why}. Run \`grok login\` in a terminal, then add Grok with "Use Grok Build's current sign-in"`
-          : `grok login finished${said}, but its sign-in in ${join(this.home, "auth.json")} names no account (no email, user id or token subject), so it can't be told from the Grok Build sign-in in ${cliHome()}. Sign in to that one with \`grok login\` and add it with "Use Grok Build's current sign-in"`)
-      }
-      this.committed = true
-      this.clear()
-      return saved(this.home, c)
-    } catch (e) {
-      this.fail(e)
-      await this.cleanup
-      return { type: "failed", error: String(this.failure?.message ?? this.failure) }
-    }
-  }
 }
 
-// signIn keeps Grok Build's native device flow and renewal owner.
+async function validateAccess(key, signal) {
+  const headers = new Headers()
+  await sign(headers, key, `${BASE}/user`)
+  signal?.throwIfAborted()
+  const response = await fetch(`${BASE}/user`, { headers, signal })
+  if (!response.ok) throw new Error(`Grok account validation failed (HTTP ${response.status})`)
+  return response.json()
+}
+
+// decision: exchange device codes directly; not spawn Grok Build login because
+// its webbrowser::open call has no cross-platform suppression switch.
 async function signIn(_inputs, { signal } = {}) {
   signal?.throwIfAborted()
-  const exe = executable()
-  if (!exe) throw new Error(NO_CLI)
-  // a sign-in mid-write is one: the CLI's own home is left be
-  const own = await credential(cliHome(), signal).then((c) => !!c, () => true)
-  signal?.throwIfAborted()
-  const attempt = new DeviceLogin(exe, own ? newHome() : cliHome(), own, signal)
-  const url = await attempt.link
-  if (!url || attempt.failure) {
-    await attempt.cleanup
-    throw attempt.failure
-  }
-  return {
-    url,
-    // not OpenCode's: the page is open already, by Grok Build itself
-    opened: opensPage(),
-    instructions: "Approve the sign-in on the page; Grok Build finishes it. This plugin waits up to 10 minutes; cancel or start again if needed.",
-    method: "auto",
-    callback: (_code, { signal: callbackSignal } = {}) => attempt.finish(callbackSignal),
+  const config = grokOAuth.configuration()
+  const attempt = new OAuthLogin(signal)
+  try {
+    const code = await grokOAuth.device(config, attempt.abort.signal)
+    attempt.abort.signal.throwIfAborted()
+    clearTimeout(attempt.deadline)
+    attempt.deadline = setTimeout(() => attempt.cancel(new Error("Grok device code expired; start again")), Math.min(LOGIN_WAIT, code.expires_in * 1000))
+    attempt.deadline.unref?.()
+    return {
+      url: code.verification_uri_complete || code.verification_uri,
+      instructions: `Open the link manually and confirm code ${code.user_code}. Keep this sign-in open until approved.`,
+      method: "auto",
+      callback: (_code, { signal: callbackSignal } = {}) => attempt.finish(async (s) => grokOAuth.nativeAuth(config, await grokOAuth.poll(config, code, s), validateAccess, s), callbackSignal),
+    }
+  } catch (error) {
+    attempt.cancel(error)
+    throw error
   }
 }
+
+async function oauthCode(inputs, { signal } = {}) {
+  signal?.throwIfAborted()
+  const config = grokOAuth.configuration(inputs)
+  const session = await grokOAuth.authorization(config)
+  signal?.throwIfAborted()
+  const attempt = new OAuthLogin(signal)
+  return {
+    url: session.url,
+    instructions: "Open the link manually, authorize, then paste the full callback URL (including state) or the authorization code. No local callback listener is started.",
+    method: "code",
+    callback: (code, { signal: callbackSignal } = {}) => attempt.finish(async (s) => grokOAuth.nativeAuth(config, await grokOAuth.exchange(config, session, code, s), validateAccess, s), callbackSignal),
+  }
+}
+
+async function oauthFields(inputs, { signal } = {}) {
+  signal?.throwIfAborted()
+  const config = grokOAuth.configuration(inputs)
+  const attempt = new OAuthLogin(signal)
+  return {
+    url: "",
+    instructions: "Validate the supplied OAuth fields with xAI, then save this account. Refresh tokens rotate: stop using this account in its previous client before continuing.",
+    method: "auto",
+    callback: (_code, { signal: callbackSignal } = {}) => attempt.finish((s, batch) => grokOAuth.accountFields(config, inputs, validateAccess, s, (tokens) => batch.rotated(config, inputs?.refresh_token, tokens)), callbackSignal),
+  }
+}
+
+const optionalField = (key, message, placeholder, type = "text") => ({ type, key, message, required: false, ...(placeholder ? { placeholder } : {}), validate: () => undefined })
+const OAUTH_PROMPTS = [
+  optionalField("client_id", "xAI OAuth client ID (blank uses Grok Build's public client)", grokOAuth.CLIENT_ID),
+  optionalField("client_secret", "Client secret (blank for a public client)", undefined, "password"),
+  { type: "select", key: "auth_method", message: "Token endpoint client authentication", required: false, options: [
+    { value: "", label: "Automatic (none without a secret; client_secret_post with a secret)" },
+    { value: "none", label: "none (public client)" },
+    { value: "client_secret_post", label: "client_secret_post" },
+    { value: "client_secret_basic", label: "client_secret_basic" },
+  ] },
+  optionalField("redirect_uri", "Registered redirect URI (no local listener is started)", grokOAuth.REDIRECT_URI),
+  optionalField("scope", "Space-separated scopes (blank uses Grok Build's scopes)", grokOAuth.SCOPE),
+]
 
 function cpaClaims(token) {
   try {
@@ -844,26 +803,23 @@ function cpaClaims(token) {
   }
 }
 
-// CPA and sub2api use the same xAI client by default. sub2api can override
-// it, so an explicit client_id and the token's issuer/audience must agree
-// with Grok Build before its CLI can own renewal of the imported account.
-function importedAuth(source, from) {
-  const cpa = from === "CPA"
-  if (!isObj(source)) throw new Error(`${from} Grok account is missing its credentials`)
-  if (cpa && source.disabled !== false) throw new Error("CPA file is not an enabled xAI OAuth account")
+// CPA's native xAI import retains its CLI renewal owner.
+function importedAuth(source) {
+  const from = "CPA"
+  if (!isObj(source)) throw new Error("CPA Grok account is missing its credentials")
+  if (source.disabled !== false) throw new Error("CPA file is not an enabled xAI OAuth account")
   const string = (v) => typeof v === "string" ? v.trim() : ""
   if (!string(source.access_token) || !string(source.refresh_token)) throw new Error(`${from} xAI account is missing its tokens or identity`)
   const claims = cpaClaims(source.access_token)
   const audience = Array.isArray(claims?.aud) ? claims.aud : [claims?.aud]
   if (claims?.iss !== "https://auth.x.ai" || !audience.includes(CPA_CLIENT_ID)) throw new Error(`${from} token is not for the Grok Build xAI account (issuer/audience mismatch)`)
   if (source.client_id !== undefined && source.client_id !== CPA_CLIENT_ID) throw new Error(`${from} client_id is not Grok Build's xAI client`)
-  const user = string(source.sub) || (!cpa ? string(source.user_id) || string(claims.sub) : "")
+  const user = string(source.sub)
   const email = string(source.email)
-  if (!user || (cpa && !email)) throw new Error(`${from} xAI account is missing its tokens or identity`)
-  const expires = cpa ? source.expired : source.expires_at
-  const created = cpa ? source.last_refresh : new Date().toISOString()
-  // BuildAccountCredentials in sub2api writes RFC3339, not Unix seconds.
-  if (typeof created !== "string" || typeof expires !== "string" || (!cpa && !RFC3339.test(expires)) || !Number.isFinite(Date.parse(created)) || !Number.isFinite(Date.parse(expires))) {
+  if (!user || !email) throw new Error(`${from} xAI account is missing its tokens or identity`)
+  const expires = source.expired
+  const created = source.last_refresh
+  if (typeof created !== "string" || typeof expires !== "string" || !Number.isFinite(Date.parse(created)) || !Number.isFinite(Date.parse(expires))) {
     throw new Error(`${from} xAI account has invalid token timestamps`)
   }
   return {
@@ -879,34 +835,25 @@ function importedAuth(source, from) {
   }
 }
 
-const IMPORT_FROM = "Choose CPA xAI OAuth account JSON or sub2api Grok OAuth account/export JSON files, or paste their JSON. Other platforms and non-OAuth accounts are skipped. Stop using these accounts in CPA or sub2api before continuing: both clients rotate the same refresh token. Source files and accounts are left unchanged."
+const IMPORT_FROM = "Choose CPA xAI OAuth account JSON files, or paste a CPA account or list. Other platforms and non-OAuth accounts are skipped. Stop using these accounts in CPA before continuing: both clients rotate the same refresh token. Source files and accounts are left unchanged."
 
 function importEntries(texts) {
   const entries = []
   for (const text of texts) {
     try {
       const source = JSON.parse(text)
-      let accounts
-      if (Array.isArray(source)) accounts = source
-      else if (isObj(source) && Array.isArray(source.accounts)) {
-        if ((source.type !== undefined && source.type !== "sub2api-data") || (source.version !== undefined && source.version !== 1)) throw new Error("unsupported sub2api export type or version")
-        accounts = source.accounts
-      } else accounts = [source]
+      const accounts = Array.isArray(source) ? source : [source]
       let matched = false
       for (const account of accounts) {
-        if (!isObj(account)) continue
-        const cpa = account.type === "xai" && account.auth_kind === "oauth"
-        if (!cpa && !(account.platform === "grok" && account.type === "oauth")) continue
+        if (!isObj(account) || account.type !== "xai" || account.auth_kind !== "oauth") continue
         matched = true
         try {
-          entries.push({ auth: importedAuth(cpa ? account : account.credentials, cpa ? "CPA" : "sub2api") })
+          entries.push({ auth: importedAuth(account) })
         } catch (e) {
           entries.push({ type: "failed", error: e.message })
         }
       }
-      if (!matched && !accounts.every((a) => isObj(a) && (typeof a.platform === "string" || a.type === "xai"))) {
-        entries.push({ type: "failed", error: "no CPA xAI or sub2api Grok OAuth account in this JSON" })
-      }
+      if (!matched && !accounts.every((a) => isObj(a) && typeof a.type === "string")) entries.push({ type: "failed", error: "no CPA xAI OAuth account in this JSON" })
     } catch (e) {
       entries.push({ type: "failed", error: e instanceof SyntaxError ? "Grok account import is not valid JSON" : e.message })
     }
@@ -916,47 +863,74 @@ function importEntries(texts) {
 
 const identityKeys = (c) => [c.user_id || c.user ? `user:${c.user_id || c.user}` : "", c.email ? `email:${c.email}` : ""].filter(Boolean)
 
-// An import is one transaction until its results are returned to magpie.
-// A cancelled batch drops every new home, not an existing sign-in it reused.
+function writeAccount(home, auth) {
+  const scope = `${auth.oidc_issuer}::${auth.oidc_client_id}`
+  writeFileSync(join(home, "auth.json"), JSON.stringify({ [scope]: auth }, null, 2), { mode: 0o600 })
+  if (auth.magpie_oauth) {
+    const config = auth.magpie_oauth
+    writeFileSync(join(home, "config.toml"), `[grok_com_config.oauth2]\nissuer = ${JSON.stringify(auth.oidc_issuer)}\nclient_id = ${JSON.stringify(auth.oidc_client_id)}\nscopes = ${JSON.stringify(config.scope.split(/\s+/))}\n`, { mode: 0o600 })
+  }
+}
+
+// Cancelled imports drop their new homes. A received rotation for an already
+// saved plugin OAuth account is retained: restoring its old RT cannot undo xAI.
 class ImportBatch {
   constructor(signal) {
     this.signal = signal
     this.homes = new Set()
     this.accounts = new Map()
+    this.refreshAccounts = new Map()
     this.tokens = new Set()
   }
 
   async existing() {
+    if (this.loaded) return
     const homes = [cliHome()]
     if (existsSync(ownHomes())) for (const d of readdirSync(ownHomes(), { withFileTypes: true })) if (d.isDirectory()) homes.push(join(ownHomes(), d.name))
     for (const home of homes) {
       this.signal?.throwIfAborted()
       const c = await credential(home, this.signal).catch(() => null)
       this.signal?.throwIfAborted()
-      if (c) for (const k of identityKeys(c)) if (!this.accounts.has(k)) this.accounts.set(k, saved(home, c))
+      if (!c) continue
+      const ownOAuth = c.oauth && !shared(home)
+      for (const k of identityKeys(c)) {
+        if (!this.accounts.has(k)) this.accounts.set(k, saved(home, c))
+        if (ownOAuth) this.accounts.set(`oauth:${k}`, saved(home, c))
+      }
+      if (ownOAuth && c.native.refresh_token) this.refreshAccounts.set(c.native.refresh_token, { home, c })
     }
+    this.loaded = true
+  }
+
+  async rotated(config, refreshToken, tokens) {
+    const owner = this.refreshAccounts.get(String(refreshToken ?? "").trim())
+    if (!owner) return undefined
+    const auth = await grokOAuth.nativeAuth(config, tokens, validateAccess, undefined, owner.c.native)
+    writeAccount(owner.home, auth)
+    return auth
   }
 
   async add(auth) {
     this.signal?.throwIfAborted()
     const keys = identityKeys(auth)
-    // One account twice in pasted files or mixed exports makes one home.
-    if (keys.some((k) => this.tokens.has(k)) || this.tokens.has(auth.refresh_token)) return null
-    for (const k of [...keys, auth.refresh_token]) this.tokens.add(k)
-    const existing = keys.map((k) => this.accounts.get(k)).find(Boolean)
-    if (existing) return existing
-    const home = newHome()
-    this.homes.add(home)
+    // One account twice in pasted files makes one home.
+    if (keys.some((k) => this.tokens.has(k)) || (auth.refresh_token && this.tokens.has(auth.refresh_token))) return null
+    for (const k of [...keys, auth.refresh_token].filter(Boolean)) this.tokens.add(k)
+    const prefix = auth.magpie_oauth ? "oauth:" : ""
+    const existing = keys.map((k) => this.accounts.get(`${prefix}${k}`)).find(Boolean)
+    if (existing && !auth.magpie_oauth) return existing
+    const home = existing?.refresh || newHome()
+    if (!existing) this.homes.add(home)
     try {
-      writeFileSync(join(home, "auth.json"), JSON.stringify({ [CPA_SCOPE]: auth }, null, 2), { mode: 0o600 })
+      writeAccount(home, auth)
       const c = await credential(home, this.signal)
       this.signal?.throwIfAborted()
       if (!c?.who) throw new Error("imported Grok Build sign-in has no account identity")
       const result = saved(home, c)
-      for (const k of keys) this.accounts.set(k, result)
+      for (const k of keys) this.accounts.set(`${prefix}${k}`, result)
       return result
     } catch (e) {
-      dropHome(home)
+      if (!existing) dropHome(home)
       this.homes.delete(home)
       throw e
     }
@@ -965,7 +939,7 @@ class ImportBatch {
   async run(entries) {
     try {
       this.signal?.throwIfAborted()
-      if (!executable()) throw new Error(NO_CLI)
+      if (entries.some((e) => e.auth && !e.auth.magpie_oauth) && !executable()) throw new Error(NO_CLI)
       await this.existing()
       const results = []
       for (const e of entries) {
@@ -1002,13 +976,13 @@ async function importCPA(inputs, { signal } = {}) {
   let text = String(inputs?.path ?? "").trim()
   if (!text.startsWith("{") && !text.startsWith("[")) {
     const file = resolve(text === "~" ? homedir() : text.startsWith("~/") ? join(homedir(), text.slice(2)) : text)
-    if (!isFile(file)) throw new Error("choose a CPA or sub2api Grok account JSON file, or paste JSON")
+    if (!isFile(file)) throw new Error("choose a CPA xAI account JSON file, or paste JSON")
     text = readFileSync(file, "utf8")
   }
   const entries = importEntries([text])
   const failed = entries.find((e) => e.error)
   if (failed) throw new Error(failed.error)
-  if (!entries.length) throw new Error("no CPA xAI or sub2api Grok OAuth account in this JSON")
+  if (!entries.length) throw new Error("no CPA xAI OAuth account in this JSON")
   // This callback saves one account. magpie's file/paste import saves a batch.
   const unique = new Map(entries.map((e) => [e.auth.user_id, e]))
   if (unique.size !== 1) throw new Error("use magpie's Import accounts from a file to import multiple Grok accounts")
@@ -1426,15 +1400,16 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
         const renewed = c && c.key !== auth.access && c.expires - Date.now() >= LEAD_MS
         const exe = executable()
         let r
-        if (!renewed && exe) {
-          r = await renew(exe, home)
+        if (!renewed && (c?.oauth ? c.native.refresh_token : exe)) {
+          r = await renew(exe, home, c)
           c = await credential(home)
         }
         // the CLI holds no sign-in there any more (`grok logout`): one
         // has to be made again
         if (!c) throw Object.assign(new Error(notSignedIn(home)), { signIn: "expired" })
+        if (c.oauth && c.expires <= Date.now()) await renew(exe, home, c)
         // the CLI couldn't renew it: tried again later
-        if (exe && c.expires && c.expires <= Date.now()) throw unrenewed(home, r)
+        if (!c.oauth && exe && c.expires && c.expires <= Date.now()) throw unrenewed(home, r)
         if (c.key === auth.access && c.expires === auth.expires) return undefined
         // magpie saves what this gives
         const out = { access: c.key, expires: c.expires }
@@ -1556,17 +1531,35 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
         },
         {
           type: "oauth",
-          label: "Import CPA / sub2api Grok account JSON",
+          label: "Import CPA xAI account JSON",
           prompts: [
             {
               type: "text",
               key: "path",
-              message: "Path to a CPA or sub2api Grok OAuth account JSON file, or paste JSON. Stop using it in the source client; its refresh token rotates.",
-              placeholder: "~/.cli-proxy-api/xai-<email>.json or {\"platform\":\"grok\",...}",
+              message: "Path to a CPA xAI OAuth account JSON file, or paste JSON. Stop using it in CPA; its refresh token rotates.",
+              placeholder: "~/.cli-proxy-api/xai-<email>.json",
               validate: (v) => (String(v ?? "").trim() ? undefined : "Enter a Grok account JSON file path or paste JSON"),
             },
           ],
           authorize: importCPA,
+        },
+        {
+          type: "oauth",
+          label: "OAuth authorization code (manual link and callback)",
+          prompts: OAUTH_PROMPTS,
+          authorize: oauthCode,
+        },
+        {
+          type: "oauth",
+          label: "OAuth account fields (refresh token / access token)",
+          prompts: [...OAUTH_PROMPTS,
+            optionalField("refresh_token", "Refresh token (validated and rotated by xAI; takes precedence over access token)", undefined, "password"),
+            optionalField("access_token", "Access token (when no refresh token is supplied)", undefined, "password"),
+            optionalField("expires_at", "Access-token expiry (RFC3339, for access-only login)", "2099-01-01T00:00:00Z"),
+            optionalField("expires_in", "Access-token lifetime in seconds (alternative to expires_at)"),
+            optionalField("token_type", "Token type", "Bearer"),
+          ],
+          authorize: oauthFields,
         },
       ],
       // magpie's: how much of the subscription's allowance is gone; each

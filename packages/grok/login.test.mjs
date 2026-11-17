@@ -1,360 +1,352 @@
-// Exercise the native CLI boundary without running Grok Build or writing a
-// login script in the user's home. The child and interaction timers are
-// controlled on Windows as well as POSIX; every filesystem target is temporary.
+// Production OAuth adapter -> native account home -> signed request/refresh.
+// Every credential is synthetic, every filesystem target is temporary, and
+// an unexpected network request or child process fails the test.
 import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
 import * as childProcess from "node:child_process"
-import { EventEmitter, getEventListeners } from "node:events"
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { getEventListeners } from "node:events"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 noRealGrok()
-
+let spawned = 0
 const realSpawn = childProcess.spawn
-let spawnLogin
-mock.module("node:child_process", () => ({ ...childProcess, spawn: (...args) => spawnLogin ? spawnLogin(...args) : realSpawn(...args) }))
+mock.module("node:child_process", () => ({ ...childProcess, spawn: (...args) => {
+  if (String(args[1]?.[0]) === "login") { spawned++; throw new Error("No CLI login may run") }
+  return realSpawn(...args)
+} }))
 const { GrokAuthPlugin } = await import("./index.mjs")
-const dir = mkdtempSync(join(tmpdir(), "grok-login-"))
-const envKeys = ["HOME", "USERPROFILE", "GROK_HOME", "GROK_BIN_DIR", "XDG_CONFIG_HOME", "GROK_AUTH_PATH", "PATH", "BROWSER"]
-const realEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]))
-const nativeSetTimeout = globalThis.setTimeout
-const nativeClearTimeout = globalThis.clearTimeout
-const LINK = "https://accounts.x.ai/oauth2/device?user_code=AB12-CD34"
-const scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-const later = "2099-01-01T00:00:00Z"
-const theirs = { [scope]: { key: "cli-tok", email: "cli@x.ai", user_id: "u-cli", expires_at: later } }
-const account = { [scope]: { key: "tok", email: null, user_id: "u-1", expires_at: later } }
-let cliHome, config, calls, children, timers, setTimer, clearTimer, behavior
+const CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
+const ISSUER = "https://auth.x.ai"
+const TOKEN = `${ISSUER}/oauth2/token`
+const USER = "https://cli-chat-proxy.grok.com/v1/user"
+const CHAT = "https://cli-chat-proxy.grok.com/v1/responses"
+const root = mkdtempSync(join(tmpdir(), "grok-oauth-"))
+const environment = { ...process.env }
+const realFetch = globalThis.fetch
+let home, config, auth, requests, respond, deadline, clearDeadline, timers
+const jwt = (claims) => `${Buffer.from(JSON.stringify({ alg: "ES256" })).toString("base64url")}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.c2ln`
+const tokens = (over = {}) => ({ access_token: "access-1", refresh_token: "refresh-1", token_type: "Bearer", expires_in: 3600, ...over })
+const homes = () => existsSync(join(config, "opencode-grok-auth")) ? readdirSync(join(config, "opencode-grok-auth")) : []
+const native = (r) => JSON.parse(readFileSync(join(r.refresh, "auth.json"), "utf8"))
+const method = (index, inputs, options) => auth.methods[index].authorize(inputs, options)
+const callback = (flow, over = {}) => { const u = new URL(flow.url); const dest = new URL(u.searchParams.get("redirect_uri")); dest.search = new URLSearchParams({ code: "code-1", state: u.searchParams.get("state"), ...over }); return dest.href }
+const listenersGone = (signal) => expect(getEventListeners(signal, "abort")).toHaveLength(0)
 
-class Child extends EventEmitter {
-  stdout = new EventEmitter()
-  stderr = new EventEmitter()
-  kills = []
-  output(text, stderr = false) { (stderr ? this.stderr : this.stdout).emit("data", Buffer.from(text)) }
-  close(code = 0) {
-    if (this.exited) return
-    this.exited = true
-    children.delete(this)
-    this.emit("exit", code)
-    this.emit("close", code)
-  }
-  kill(signal) {
-    this.kills.push(signal)
-    // A child may finish a write as it is killed. Cleanup must follow exit.
-    queueMicrotask(() => {
-      writeFileSync(join(this.home, "late-write"), "temporary")
-      this.close(null)
-    })
-    return true
-  }
-}
-
-beforeEach(() => {
-  cliHome = mkdtempSync(join(dir, "home-"))
-  config = mkdtempSync(join(dir, "config-"))
-  const user = mkdtempSync(join(dir, "user-"))
-  const bin = mkdtempSync(join(dir, "bin-"))
-  writeFileSync(join(bin, process.platform === "win32" ? "grok.exe" : "grok"), "not an executable; spawn is mocked")
-  Object.assign(process.env, { HOME: user, USERPROFILE: user, GROK_HOME: cliHome, GROK_BIN_DIR: bin, XDG_CONFIG_HOME: config, PATH: "" })
-  calls = []
-  children = new Set()
+beforeEach(async () => {
+  home = mkdtempSync(join(root, "cli-"))
+  config = mkdtempSync(join(root, "config-"))
+  const user = mkdtempSync(join(root, "user-"))
+  Object.assign(process.env, { HOME: user, USERPROFILE: user, GROK_HOME: home, GROK_BIN_DIR: join(root, "no-bin"), PATH: "", XDG_CONFIG_HOME: config })
+  delete process.env.GROK_AUTH_PATH
+  spawned = 0
+  requests = []
   timers = new Map()
-  behavior = () => {}
-  setTimer = spyOn(globalThis, "setTimeout").mockImplementation((fn, ms, ...args) => {
-    if (ms !== 100 && ms !== 30_000 && ms !== 600_000) return nativeSetTimeout(fn, ms, ...args)
-    const timer = { ms, fire: () => { timers.delete(timer); fn(...args) } }
-    timers.set(timer, timer)
+  const set = globalThis.setTimeout
+  const clear = globalThis.clearTimeout
+  deadline = spyOn(globalThis, "setTimeout").mockImplementation((fn, ms, ...args) => {
+    if (![600_000, 60_000, 30_000].includes(ms)) return set(fn, ms, ...args)
+    const timer = set(fn, ms, ...args)
+    timers.set(timer, () => fn(...args))
     return timer
   })
-  clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
-    if (!timers.delete(timer)) nativeClearTimeout(timer)
-  })
-  spawnLogin = (exe, args, options) => {
-    const child = new Child()
-    child.home = options.env.GROK_HOME
-    calls.push({ exe, args, options, child })
-    children.add(child)
-    queueMicrotask(() => behavior(child, options))
-    return child
+  clearDeadline = spyOn(globalThis, "clearTimeout").mockImplementation((timer) => { timers.delete(timer); clear(timer) })
+  respond = async (url) => {
+    if (url === USER) return Response.json({ userId: "user-1", email: "one@example.invalid" })
+    if (url === TOKEN) return Response.json(tokens())
+    if (url === CHAT) return Response.json({ output: [] })
+    throw new Error(`Unexpected URL ${url}`)
   }
+  globalThis.fetch = async (url, init = {}) => {
+    init.signal?.throwIfAborted()
+    const record = { url: String(url), params: new URLSearchParams(init.body instanceof URLSearchParams ? init.body : ""), headers: new Headers(init.headers), signal: init.signal }
+    requests.push(record)
+    return respond(String(url), init, record)
+  }
+  auth = (await GrokAuthPlugin({})).auth
 })
-
 afterEach(() => {
-  for (const child of children) child.close(1)
-  setTimer.mockRestore()
-  clearTimer.mockRestore()
-  spawnLogin = undefined
-  for (const [k, v] of Object.entries(realEnv)) v === undefined ? delete process.env[k] : (process.env[k] = v)
+  const pending = timers.size
+  for (const timer of timers.keys()) clearTimeout(timer)
+  deadline.mockRestore()
+  clearDeadline.mockRestore()
+  globalThis.fetch = realFetch
+  for (const k of Object.keys(process.env)) if (!(k in environment)) delete process.env[k]
+  Object.assign(process.env, environment)
+  expect(pending).toBe(0)
 })
-afterAll(() => rmSync(dir, { recursive: true, force: true }))
+afterAll(() => rmSync(root, { recursive: true, force: true }))
 
-const homes = () => existsSync(join(config, "opencode-grok-auth")) ? readdirSync(join(config, "opencode-grok-auth")) : []
-const fire = (ms) => {
-  const timer = [...timers.values()].find((t) => t.ms === ms)
-  expect(timer).toBeDefined()
-  timer.fire()
-}
-const drained = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
-const authorize = async (signal) => (await GrokAuthPlugin({})).auth.methods[0].authorize(undefined, { signal })
-const existing = () => writeFileSync(join(cliHome, "auth.json"), JSON.stringify(theirs))
-function complete(child, what = account) {
-  if (what) writeFileSync(join(child.home, "auth.json"), JSON.stringify(what))
-  child.output("✓ Signed in\n")
-  child.close(0)
-}
-function released(signal) {
-  expect(children.size).toBe(0)
-  expect(timers.size).toBe(0)
-  if (signal) expect(getEventListeners(signal, "abort")).toHaveLength(0)
-  for (const { child } of calls) {
-    expect(child.stdout.listenerCount("data")).toBe(0)
-    expect(child.stderr.listenerCount("data")).toBe(0)
-    expect(child.listenerCount("error")).toBe(0)
-    expect(child.listenerCount("exit")).toBe(0)
-    expect(child.listenerCount("close")).toBe(0)
-  }
+function codeResponder(flow, over = {}) {
+  const url = new URL(flow.url)
+  respond = async (target) => target === TOKEN ? Response.json(tokens({ id_token: jwt({ iss: ISSUER, aud: url.searchParams.get("client_id"), sub: "user-1", exp: Math.floor(Date.now() / 1000) + 3600, iat: Math.floor(Date.now() / 1000), nonce: url.searchParams.get("nonce") }), ...over })) : target === USER ? Response.json({ userId: "user-1" }) : target === CHAT ? Response.json({ output: [] }) : Promise.reject(new Error(target))
 }
 
-test("pre-aborted sign-in allocates no home and starts no CLI", async () => {
-  existing()
+test("authorization-code tracer saves native credentials and consumes them through the signed production request", async () => {
+  expect(auth.methods[3].prompts.find((p) => p.key === "client_secret").type).toBe("password")
   const c = new AbortController()
-  c.abort()
-  await expect(authorize(c.signal)).rejects.toThrow()
-  expect(calls).toHaveLength(0)
-  expect(homes()).toEqual([])
-  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
-  released(c.signal)
-})
-
-test("cancellation during the initial credential read starts no CLI or new home", async () => {
-  existing()
-  const auth = (await GrokAuthPlugin({})).auth
-  const c = new AbortController()
-  const pending = auth.methods[0].authorize(undefined, { signal: c.signal })
-  c.abort()
-  await expect(pending).rejects.toThrow()
-  expect(calls).toHaveLength(0)
-  expect(homes()).toEqual([])
-  released(c.signal)
-})
-
-test("an asynchronous spawn error releases its home and retains the error", async () => {
-  existing()
-  behavior = (child) => child.emit("error", new Error("CLI unavailable"))
-  await expect(authorize()).rejects.toThrow("CLI unavailable")
-  expect(homes()).toEqual([])
-  released()
-})
-
-test("startup failure releases its new home and preserves the CLI diagnosis", async () => {
-  existing()
-  spawnLogin = () => { throw new Error("spawn denied") }
-  await expect(authorize()).rejects.toThrow("spawn denied")
-  expect(homes()).toEqual([])
-  released()
-})
-
-test("cancelling while waiting for the link reaps the CLI before removing only its new home", async () => {
-  existing()
-  const c = new AbortController()
-  const pending = authorize(c.signal)
-  await drained()
-  expect(homes()).toHaveLength(1)
-  c.abort()
-  await expect(pending).rejects.toThrow()
-  expect(calls[0].child.kills).toEqual(["SIGKILL"])
-  expect(homes()).toEqual([])
-  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
-  released(c.signal)
-})
-
-test("a no-link timeout keeps the last CLI network diagnosis, with bounded output handling", async () => {
-  existing()
-  behavior = (child) => {
-    for (let i = 0; i < 1024; i++) child.output("x".repeat(8192))
-    child.output("\n\u001b[31mError: error sending request for url (https://auth.x.ai/oauth2/device/code): proxy refused\u001b[0m\n", true)
-  }
-  const pending = authorize()
-  await drained()
-  fire(30_000)
-  await expect(pending).rejects.toThrow("Error: error sending request for url (https://auth.x.ai/oauth2/device/code): proxy refused")
-  expect(homes()).toEqual([])
-  released()
-})
-
-test("a silent failed CLI retains the reachability diagnostic and leaves an existing CLI home alone", async () => {
-  behavior = (child) => child.close(1)
-  await expect(authorize()).rejects.toThrow("can this machine reach auth.x.ai?")
-  expect(existsSync(cliHome)).toBe(true)
-  released()
-})
-
-test("a callback can cancel a running device login and retries start cleanly", async () => {
-  existing()
-  behavior = (child) => child.output(`${LINK}\n`)
-  const a = await authorize()
-  const c = new AbortController()
-  const pending = a.callback(undefined, { signal: c.signal })
-  c.abort()
-  expect((await pending).type).toBe("failed")
-  expect(homes()).toEqual([])
-  released(c.signal)
-
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
-  const retry = await authorize()
-  expect((await retry.callback()).type).toBe("success")
-  expect(homes()).toHaveLength(1)
-  released()
-})
-
-test("cancellation reaps the writer without waiting on a browser's inherited pipes", async () => {
-  existing()
-  behavior = (child) => child.output(`${LINK}\n`)
-  const a = await authorize()
-  const child = calls[0].child
-  child.kill = (signal) => {
-    child.kills.push(signal)
-    queueMicrotask(() => { child.exited = true; children.delete(child); child.emit("exit", null, signal) })
-    return true
-  }
-  const c = new AbortController()
-  const pending = a.callback(undefined, { signal: c.signal })
-  c.abort()
-  expect((await pending).type).toBe("failed")
-  expect(homes()).toEqual([])
-  child.emit("close", null)
-  released(c.signal)
-})
-
-test("callback cancellation interrupts torn-file retry timers as well as the device wait", async () => {
-  existing()
-  behavior = (child) => {
-    child.output(`${LINK}\n`)
-    writeFileSync(join(child.home, "auth.json"), "")
-    child.close(0)
-  }
-  const a = await authorize()
-  const c = new AbortController()
-  const pending = a.callback(undefined, { signal: c.signal })
-  await drained()
-  expect([...timers.values()].some((t) => t.ms === 100)).toBe(true)
-  c.abort()
-  expect((await pending).type).toBe("failed")
-  expect(homes()).toEqual([])
-  released(c.signal)
-})
-
-test("an abandoned callback expires and cleans a successful but unsaved new home", async () => {
-  existing()
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
-  const a = await authorize()
-  expect(homes()).toHaveLength(1)
-  fire(600_000)
-  await drained()
-  expect(homes()).toEqual([])
-  expect((await a.callback()).type).toBe("failed")
-  released()
-})
-
-test("the device deadline also stops a running callback, without deleting the CLI home", async () => {
-  behavior = (child) => child.output(`${LINK}\n`)
-  const a = await authorize()
-  const pending = a.callback()
-  fire(600_000)
-  expect((await pending).type).toBe("failed")
-  expect(calls[0].child.kills).toEqual(["SIGKILL"])
-  expect(existsSync(cliHome)).toBe(true)
-  released()
-})
-
-test("authorize cancellation remains active after the link, including before callback", async () => {
-  existing()
-  const c = new AbortController()
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
-  const a = await authorize(c.signal)
-  c.abort()
-  await drained()
-  expect(homes()).toEqual([])
-  expect((await a.callback()).type).toBe("failed")
-  released(c.signal)
-})
-
-test("a successful email-less sign-in is saved once; a repeated or pre-aborted callback cannot delete it", async () => {
-  existing()
-  const c = new AbortController()
-  const away = join(dir, "do-not-write-auth.json")
-  process.env.GROK_AUTH_PATH = away
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
-  const a = await authorize(c.signal)
-  const [r, repeated] = await Promise.all([a.callback(), a.callback()])
-  expect(a.url).toBe(LINK)
-  expect(a.opened).toBe(process.platform === "win32" || process.platform === "darwin")
-  expect(r).toEqual(repeated)
-  expect(r.accountId).toBe("u-1")
+  const flow = await method(3, { client_id: "configured-client", client_secret: "synthetic-secret", auth_method: "client_secret_basic", redirect_uri: "https://callback.example.invalid/grok", scope: "openid offline_access grok-cli:access" }, { signal: c.signal })
+  expect(requests).toEqual([])
+  expect(flow.method).toBe("code")
+  const url = new URL(flow.url)
+  expect(url.origin + url.pathname).toBe(`${ISSUER}/oauth2/authorize`)
+  expect(url.searchParams.get("code_challenge_method")).toBe("S256")
+  codeResponder(flow)
+  const [r, again] = await Promise.all([flow.callback(callback(flow)), flow.callback(callback(flow))])
+  expect(r).toEqual(again)
   expect(r.type).toBe("success")
-  expect(calls[0].args).toEqual(["login", "--device-auth"])
-  expect(calls[0].options.cwd).toBe(process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME)
-  expect(calls[0].options.env.GROK_AUTH_PATH).toBeUndefined()
-  if (!a.opened) expect(calls[0].options.env.BROWSER).toBe("true")
-  expect(existsSync(away)).toBe(false)
+  expect(r.accountId).toBe("user-1")
+  const stored = native(r)[`${ISSUER}::configured-client`]
+  expect(stored.oidc_client_id).toBe("configured-client")
+  expect(stored.refresh_token).toBe("refresh-1")
+  expect(stored.magpie_oauth.auth_method).toBe("client_secret_basic")
+  expect(Bun.TOML.parse(readFileSync(join(r.refresh, "config.toml"), "utf8")).grok_com_config.oauth2.client_id).toBe("configured-client")
+  const grant = requests.find((r) => r.url === TOKEN)
+  expect(grant.params.get("grant_type")).toBe("authorization_code")
+  const basic = Buffer.from(grant.headers.get("authorization").split(" ")[1], "base64").toString().split(":").map(decodeURIComponent)
+  expect(basic).toEqual(["configured-client", "synthetic-secret"])
+  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(grant.params.get("code_verifier")))).toString("base64url")
+  expect(challenge).toBe(url.searchParams.get("code_challenge"))
+  const opts = await auth.loader(async () => ({ ...r, type: "oauth" }))
+  expect((await opts.fetch(CHAT, { method: "POST", body: '{"model":"grok-4.7","input":"hello"}' })).status).toBe(200)
+  expect(requests.at(-1).headers.get("authorization")).toBe("Bearer access-1")
+  expect(requests.at(-1).headers.get("x-xai-token-auth")).toBe("xai-grok-cli")
   c.abort()
-  expect(await a.callback(undefined, { signal: c.signal })).toEqual(r)
-  expect(existsSync(join(r.refresh, "auth.json"))).toBe(true)
+  expect(await flow.callback("ignored", { signal: c.signal })).toEqual(r)
+  listenersGone(c.signal)
   expect(homes()).toHaveLength(1)
-  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
-  released(c.signal)
+  expect(spawned).toBe(0)
 })
 
-test("a pre-aborted first callback cleans its unsaved new home", async () => {
-  existing()
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
-  const a = await authorize()
+test("a bare authorization code is bound to its PKCE attempt", async () => {
+  const flow = await method(3)
+  codeResponder(flow)
+  expect((await flow.callback("bare-code")).type).toBe("success")
+  expect(requests.find((r) => r.url === TOKEN).params.get("code")).toBe("bare-code")
+})
+
+test("an OAuth-only configured scope does not require an OIDC ID token", async () => {
+  const flow = await method(3, { scope: "offline_access grok-cli:access api:access" })
+  expect(new URL(flow.url).searchParams.has("nonce")).toBe(false)
+  codeResponder(flow, { id_token: undefined })
+  expect((await flow.callback(callback(flow))).type).toBe("success")
+})
+
+test("wrong state, wrong redirect and upstream code failures create no account; a new attempt retries", async () => {
+  for (const kind of ["state", "redirect", "upstream"]) {
+    const flow = await method(3)
+    codeResponder(flow)
+    let input = callback(flow, kind === "state" ? { state: "foreign-state" } : {})
+    if (kind === "redirect") input = input.replace("/callback", "/elsewhere")
+    if (kind === "upstream") respond = async () => Response.json({ error: "invalid_grant" }, { status: 400 })
+    const r = await flow.callback(input)
+    expect(r.type).toBe("failed")
+    expect(await flow.callback(callback(flow))).toEqual(r)
+    expect(homes()).toEqual([])
+  }
+  const retry = await method(3)
+  codeResponder(retry)
+  expect((await retry.callback(callback(retry))).type).toBe("success")
+  expect(spawned).toBe(0)
+})
+
+test("refresh-token fields validate, preserve rotation, and refresh concurrently with real request consumption", async () => {
+  for (const key of ["client_secret", "refresh_token", "access_token"]) expect(auth.methods[4].prompts.find((p) => p.key === key).type).toBe("password")
+  const flow = await method(4, { client_id: "custom", client_secret: "test-secret", refresh_token: "refresh-0", access_token: "ignored" })
+  const r = await flow.callback()
+  expect(r.type).toBe("success")
+  expect(requests[0].params.get("refresh_token")).toBe("refresh-0")
+  expect(requests[0].params.get("client_secret")).toBe("test-secret")
+  expect(native(r)[`${ISSUER}::custom`].refresh_token).toBe("refresh-1")
+  const all = native(r)
+  all[`${ISSUER}::custom`].expires_at = new Date(Date.now() + 1000).toISOString()
+  writeFileSync(join(r.refresh, "auth.json"), JSON.stringify(all))
+  requests = []
+  respond = async (url) => url === TOKEN ? Response.json(tokens({ access_token: "access-2", refresh_token: "refresh-2" })) : url === CHAT ? Response.json({ output: [] }) : Promise.reject(new Error(url))
+  const account = { ...r, type: "oauth", expires: Date.now() + 1000 }
+  const opts = await auth.loader(async () => account)
+  const [renewed, sent] = await Promise.all([auth.refresh(account), opts.fetch(CHAT, { method: "POST", body: '{"model":"grok-4.7"}' })])
+  expect(renewed.access).toBe("access-2")
+  expect(sent.status).toBe(200)
+  expect(requests.filter((r) => r.url === TOKEN)).toHaveLength(1)
+  expect(requests[0].params.get("client_id")).toBe("custom")
+  expect(requests[0].params.get("refresh_token")).toBe("refresh-1")
+  expect(native(r)[`${ISSUER}::custom`].refresh_token).toBe("refresh-2")
+  expect(requests.at(-1).headers.get("authorization")).toBe("Bearer access-2")
+  expect(spawned).toBe(0)
+})
+
+test("new OAuth logins leave native and CPA credentials unchanged, then update only their own saved home", async () => {
+  const scope = `${ISSUER}::${CLIENT}`
+  const legacy = JSON.stringify({ [scope]: { key: "legacy-access", user_id: "user-1", email: "one@example.invalid", refresh_token: "legacy-refresh", expires_at: "2099-01-01T00:00:00Z", oidc_issuer: ISSUER, oidc_client_id: CLIENT } })
+  const cpaHome = join(config, "opencode-grok-auth", "cpa-existing")
+  mkdirSync(cpaHome, { recursive: true })
+  for (const path of [home, cpaHome]) {
+    writeFileSync(join(path, "auth.json"), legacy)
+    writeFileSync(join(path, "config.toml"), "# existing config\n")
+  }
+  const first = await (await method(4, { refresh_token: "fresh-login" })).callback()
+  expect(first.type).toBe("success")
+  expect(first.refresh).not.toBe(home)
+  expect(first.refresh).not.toBe(cpaHome)
+  const next = await method(3, { client_id: "another-configured-client" })
+  codeResponder(next, { refresh_token: "refresh-next" })
+  const second = await next.callback(callback(next))
+  expect(second.type).toBe("success")
+  expect(second.refresh).toBe(first.refresh)
+  expect(native(second)[`${ISSUER}::another-configured-client`].refresh_token).toBe("refresh-next")
+  expect(homes()).toHaveLength(2)
+  for (const path of [home, cpaHome]) {
+    expect(readFileSync(join(path, "auth.json"), "utf8")).toBe(legacy)
+    expect(readFileSync(join(path, "config.toml"), "utf8")).toBe("# existing config\n")
+  }
+  expect(spawned).toBe(0)
+})
+
+test("cancellation after a saved account's refresh rotation retains its successor and retries in the same home", async () => {
+  const first = await (await method(4, { refresh_token: "refresh-0" })).callback()
   const c = new AbortController()
+  const flow = await method(4, { refresh_token: "refresh-1" }, { signal: c.signal })
+  respond = async (url) => {
+    expect(url).toBe(TOKEN)
+    c.abort()
+    return Response.json(tokens({ access_token: "access-2", refresh_token: "refresh-2" }))
+  }
+  expect((await flow.callback()).type).toBe("failed")
+  expect(native(first)[`${ISSUER}::${CLIENT}`].refresh_token).toBe("refresh-2")
+  listenersGone(c.signal)
+  respond = async (url) => {
+    expect(url).toBe(TOKEN)
+    return Response.json(tokens({ refresh_token: "refresh-3" }))
+  }
+  const retry = await (await method(4, { refresh_token: "refresh-2" })).callback()
+  expect(retry.type).toBe("success")
+  expect(retry.refresh).toBe(first.refresh)
+  expect(native(retry)[`${ISSUER}::${CLIENT}`].refresh_token).toBe("refresh-3")
+  expect(homes()).toHaveLength(1)
+})
+
+test("failed renewal preserves the saved credential and releases its flight so a retry can succeed", async () => {
+  const first = await (await method(4, { refresh_token: "refresh-0" })).callback()
+  const account = { ...first, type: "oauth" }
+  const before = readFileSync(join(first.refresh, "auth.json"), "utf8")
+  respond = async (url) => {
+    expect(url).toBe(TOKEN)
+    return Response.json({ error: "temporarily_unavailable" }, { status: 503 })
+  }
+  await expect(auth.refresh(account)).rejects.toThrow()
+  expect(readFileSync(join(first.refresh, "auth.json"), "utf8")).toBe(before)
+  respond = async (url) => {
+    expect(url).toBe(TOKEN)
+    return Response.json(tokens({ access_token: "access-retry", refresh_token: "refresh-retry" }))
+  }
+  expect((await auth.refresh(account)).access).toBe("access-retry")
+  expect(native(first)[`${ISSUER}::${CLIENT}`].refresh_token).toBe("refresh-retry")
+  expect(requests.filter((r) => r.params.get("refresh_token") === "refresh-1")).toHaveLength(2)
+  expect(homes()).toHaveLength(1)
+})
+
+test("abandoned code and expired device attempts release their deadlines and signal listeners", async () => {
+  for (const kind of [3, 0]) {
+    respond = async (url) => url === `${ISSUER}/oauth2/device/code` ? Response.json({ device_code: "expired-device", user_code: "ABCD", verification_uri: "https://accounts.x.ai/device", expires_in: 60, interval: 1 }) : Promise.reject(new Error(url))
+    const c = new AbortController()
+    const flow = await method(kind, {}, { signal: c.signal })
+    expect(timers.size).toBe(1)
+    timers.values().next().value()
+    expect(timers.size).toBe(0)
+    listenersGone(c.signal)
+    expect((await flow.callback(kind === 3 ? callback(flow) : undefined)).type).toBe("failed")
+    expect(homes()).toEqual([])
+  }
+  expect(requests.map((r) => r.url)).toEqual([`${ISSUER}/oauth2/device/code`])
+})
+
+test("access-only fields validate against Grok, keep no invented refresh token, and report renewal needs at expiry", async () => {
+  const flow = await method(4, { access_token: "existing-access", expires_at: "2099-01-01T00:00:00Z" })
+  const r = await flow.callback()
+  expect(r.type).toBe("success")
+  expect(requests.map((r) => r.url)).toEqual([USER])
+  const scope = `${ISSUER}::${CLIENT}`
+  expect(native(r)[scope].refresh_token).toBeUndefined()
+  expect(await auth.refresh({ ...r, type: "oauth" })).toBeUndefined()
+  const all = native(r)
+  all[scope].expires_at = "2020-01-01T00:00:00Z"
+  writeFileSync(join(r.refresh, "auth.json"), JSON.stringify(all))
+  const opts = await auth.loader(async () => ({ ...r, type: "oauth" }))
+  await expect(opts.fetch(CHAT, { method: "POST", body: "{}" })).rejects.toThrow()
+  expect(requests.map((r) => r.url)).toEqual([USER])
+})
+
+test("invalid account fields and failed token or account validation leave no home", async () => {
+  for (const inputs of [{}, { access_token: "x" }, { access_token: "x", expires_in: "-1" }, { access_token: "x", expires_in: "3600", token_type: "other" }]) {
+    const flow = await method(4, inputs)
+    expect((await flow.callback()).type).toBe("failed")
+  }
+  for (const status of [401, 500]) {
+    respond = async () => Response.json({ error: "invalid_grant" }, { status })
+    expect((await (await method(4, { refresh_token: "bad" })).callback()).type).toBe("failed")
+    expect((await (await method(4, { access_token: "bad", expires_in: "3600" })).callback()).type).toBe("failed")
+  }
+  await expect(method(3, { client_secret: "x", auth_method: "none" })).rejects.toThrow()
+  await expect(method(3, { auth_method: "client_secret_post" })).rejects.toThrow()
+  expect(homes()).toEqual([])
+})
+
+test("cancel before authorization, before callback and during HTTP releases listeners and retries without residual homes", async () => {
+  const pre = new AbortController()
+  pre.abort()
+  await expect(method(3, {}, { signal: pre.signal })).rejects.toThrow()
+  await expect(method(4, {}, { signal: pre.signal })).rejects.toThrow()
+  await expect(method(0, {}, { signal: pre.signal })).rejects.toThrow()
+  expect(requests).toEqual([])
+  const c = new AbortController()
+  const cancelled = await method(3, {}, { signal: c.signal })
   c.abort()
-  expect((await a.callback(undefined, { signal: c.signal })).type).toBe("failed")
+  expect((await cancelled.callback(callback(cancelled))).type).toBe("failed")
+  listenersGone(c.signal)
+  const during = new AbortController()
+  const flow = await method(4, { refresh_token: "cancelled" }, { signal: during.signal })
+  let started
+  const entered = new Promise((ok) => { started = ok })
+  respond = (_url, init) => new Promise((_ok, fail) => {
+    init.signal.addEventListener("abort", () => fail(init.signal.reason), { once: true })
+    started()
+  })
+  const pending = flow.callback()
+  await entered
+  during.abort()
+  expect((await pending).type).toBe("failed")
+  listenersGone(during.signal)
   expect(homes()).toEqual([])
-  released(c.signal)
+  const retry = await method(3)
+  codeResponder(retry)
+  expect((await retry.callback(callback(retry))).type).toBe("success")
 })
 
-test("a failed CLI after printing a link cleans its home without waiting for a callback", async () => {
-  existing()
-  behavior = (child) => child.output(`${LINK}\n`)
-  const a = await authorize()
-  calls[0].child.output("device approval denied\n", true)
-  calls[0].child.close(1)
-  await drained()
+test("device login requests the real protocol without spawning or opening a browser; cancellation stops the wait", async () => {
+  respond = async (url) => url === `${ISSUER}/oauth2/device/code` ? Response.json({ device_code: "device-1", user_code: "ABCD-EFGH", verification_uri: "https://accounts.x.ai/device", verification_uri_complete: "https://accounts.x.ai/device?user_code=ABCD-EFGH", expires_in: 60, interval: 1 }) : Promise.reject(new Error(url))
+  const c = new AbortController()
+  const flow = await method(0, {}, { signal: c.signal })
+  expect(flow.url).toBe("https://accounts.x.ai/device?user_code=ABCD-EFGH")
+  expect(requests[0].params.get("client_id")).toBe(CLIENT)
+  expect(requests[0].params.get("scope").split(" ")).toContain("grok-cli:access")
+  const pending = flow.callback()
+  c.abort()
+  expect((await pending).type).toBe("failed")
   expect(homes()).toEqual([])
-  expect(await a.callback()).toEqual({ type: "failed", error: "device approval denied" })
-  released()
+  expect(spawned).toBe(0)
+  listenersGone(c.signal)
 })
 
-test("a token's subject identifies an X sign-in when email and user_id are absent", async () => {
-  existing()
-  const key = `e30.${Buffer.from(JSON.stringify({ sub: "u-sub", iss: "https://auth.x.ai" })).toString("base64url")}.sig`
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { key, email: null, expires_at: later } }) }
-  const a = await authorize()
-  expect((await a.callback()).accountId).toBe("u-sub")
-  released()
-})
-
-test("a successful CLI that leaves no usable account preserves the existing file diagnostics", async () => {
-  existing()
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { key: "tok", email: null, expires_at: later } }) }
-  let a = await authorize()
-  expect((await a.callback()).error).toContain("names no account")
-  expect(homes()).toEqual([])
-  released()
-
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child, null) }
-  a = await authorize()
-  expect((await a.callback()).error).toContain("left no sign-in where this plugin reads it")
-  expect(homes()).toEqual([])
-  released()
-
-  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { email: "g@x.ai" } }) }
-  a = await authorize()
-  expect((await a.callback()).error).toContain(`has ${scope}, none with a token`)
-  expect(homes()).toEqual([])
-  released()
+test("device approval uses the shared token/account writer and leaves only its saved home", async () => {
+  respond = async (url) => url === `${ISSUER}/oauth2/device/code` ? Response.json({ device_code: "device-1", user_code: "ABCD-EFGH", verification_uri: "https://accounts.x.ai/device", expires_in: 60, interval: 1 }) : url === TOKEN ? Response.json(tokens()) : url === USER ? Response.json({ userId: "device-user" }) : Promise.reject(new Error(url))
+  const flow = await method(0)
+  const r = await flow.callback()
+  expect(r.type).toBe("success")
+  expect(r.accountId).toBe("device-user")
+  expect(requests.find((r) => r.url === TOKEN).params.get("grant_type")).toBe("urn:ietf:params:oauth:grant-type:device_code")
+  expect(homes()).toHaveLength(1)
+  expect(await flow.callback()).toEqual(r)
+  expect(spawned).toBe(0)
 })

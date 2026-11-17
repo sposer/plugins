@@ -11,8 +11,9 @@ import { agyRefusal, createUsageReader, verifyLinkIn, verifyRefused } from "./us
 import { catalogRows, storeCatalogRows } from "./model-ids.mjs"
 import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
-import { startLogin } from "./login.mjs"
-import { accountsDir, currentHome, dropHome, homeIdOfAuth, homeOf, inAccount, newHome, tokenFile } from "./account.mjs"
+import { LoginAttempt, startLogin } from "./login.mjs"
+import { CODE_PROMPTS, TOKEN_PROMPTS, configuredLogin, nativeClient, oauthConfig, tokenLogin } from "./oauth.mjs"
+import { accountsDir, currentHome, dropHome, homeIdOfAuth, homeOf, inAccount, newHome, writeTokenFile } from "./account.mjs"
 import { IMPORT_FROM, importedAccounts, tokenFileText } from "./import.mjs"
 import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { documentRefusal, documentText } from "./documents.mjs"
@@ -6648,52 +6649,95 @@ function noAgy() {
 // account by it, not as "API key"). An account with a home of its own
 // (account.mjs) keeps the home's name with it, and a key of its own, so
 // two accounts whose email can't be read aren't taken for one.
-async function signedInAs(homeId = "") {
+async function signedInAs(homeId = "", key = homeId ? `agy:${homeId}` : "agy") {
   const email = await storedEmail()
   const metadata = { ...(email ? { email } : {}), ...(homeId ? { agyHome: homeId } : {}) }
-  return { type: "success", key: homeId ? `agy:${homeId}` : "agy", ...(Object.keys(metadata).length ? { metadata } : {}) }
+  return { type: "success", key, ...(Object.keys(metadata).length ? { metadata } : {}) }
 }
 
-// googleSignIn runs agy's own Google sign-in: its link, then the code the
-// page shows. account ({ id, home }) is a new account's own home: agy
-// signs in there, and the home goes again when the sign-in fails.
-// decision: keep OAuth exchange in agy; not copy sub2api's Google token
-// exchange because agy owns the CLI's sign-in and credential format.
-async function googleSignIn(agy, account = null, { signal } = {}) {
-  const home = account?.home ?? null
-  const cleanup = () => { if (account) dropHome(home) }
-  const fail = (error) => {
-    cleanup()
-    return { type: "failed", error }
-  }
-  const login = await inAccount(home, () => startLogin(agy, { signal, onFailure: cleanup }))
-  if (login.error) return fail(login.error)
+async function completeSignIn(agy, account, { signal, key } = {}) {
+  signal?.throwIfAborted()
+  forgetStoredSignIn({ dead: true })
+  forgetOffered()
+  const probe = await probeSignedIn(agy, { signal })
+  if (!probe.ok) throw new Error(`agy couldn't sign in: ${probe.why}`)
+  signal?.throwIfAborted()
+  return signedInAs(account.id, key)
+}
+
+// All login methods publish through the same account callback. A replay never
+// removes a successful home, and a failed/cancelled verification removes only
+// the new home. Imports below use the same writer and native verification.
+function signInCallback(login, account, { signal, after } = {}) {
   let submitted = false
+  return async (code, opts = {}) => {
+    if (submitted) return { type: "failed", error: "this sign-in has already checked a code; start it again" }
+    submitted = true
+    return inAccount(account.home, async () => {
+      const signals = [signal, opts.signal].filter(Boolean)
+      const active = signals.length ? AbortSignal.any(signals) : undefined
+      try {
+        const done = await login.finish(code, { signal: active })
+        if (done.error) throw new Error(done.error)
+        const result = after ? await after(active) : done
+        active?.throwIfAborted()
+        return result
+      } catch (error) {
+        dropHome(account.home)
+        forgetStoredSignIn()
+        return { type: "failed", error: error.message }
+      }
+    })
+  }
+}
+
+async function googleSignIn(agy, account, { signal, key } = {}) {
+  const login = await inAccount(account.home, () => startLogin(agy, { signal, onFailure: () => dropHome(account.home) }))
+  if (login.error) return { type: "failed", error: login.error }
   return {
     url: login.url,
-    instructions: "Sign in with Google in the browser, then paste the authorization code or the full URL of the page you land on here. This also works over SSH and in Docker. The link expires after 15 minutes; starting another sign-in replaces it.",
+    instructions: "Open the authorization link manually and sign in with Google, then paste the authorization code or complete callback URL here. The link expires after 15 minutes; starting another sign-in replaces it.",
     method: "code",
-    callback: async (code, opts = {}) => {
-      if (submitted) return { type: "failed", error: "this sign-in has already checked a code; start it again" }
-      submitted = true
-      return inAccount(home, async () => {
-        const signals = [signal, opts.signal].filter(Boolean)
-        const activeSignal = signals.length ? AbortSignal.any(signals) : undefined
-        try {
-          const done = await login.finish(code, { signal: activeSignal })
-          if (done.error) return fail(done.error)
-          // agy stored a new sign-in: reread it and rediscover this account's models.
-          forgetStoredSignIn({ dead: true })
-          forgetOffered()
-          const probe = await probeSignedIn(agy, { signal: activeSignal })
-          if (!probe.ok) return fail(`agy signed in, but ${probe.why}`)
-          const result = await signedInAs(account?.id ?? "")
-          return activeSignal?.aborted ? fail("the sign-in was cancelled") : result
-        } catch (error) {
-          return fail(error.message)
-        }
-      })
-    },
+    callback: signInCallback(login, account, { signal, after: active => completeSignIn(agy, account, { signal: active, key }) }),
+  }
+}
+
+async function oauthSignIn(inputs, { signal, tokens = false } = {}) {
+  if (signal?.aborted) return { type: "failed", error: "the sign-in was cancelled" }
+  const agy = findAgy()
+  if (!agy) return noAgy()
+  let account
+  try {
+    const config = oauthConfig(inputs)
+    account = newHome()
+    const complete = async (token, active) => inAccount(account.home, async () => {
+      active.throwIfAborted()
+      const adc = nativeClient(config) ? null : {
+        type: "authorized_user", client_id: config.client_id, client_secret: config.client_secret,
+        refresh_token: token.refresh, token_uri: config.token_uri,
+      }
+      writeTokenFile(account.home, tokenFileText(token), adc)
+      return completeSignIn(agy, account, { signal: active })
+    })
+    const options = { signal, onFailure: () => dropHome(account.home), complete }
+    let login
+    if (tokens) {
+      const attempt = new LoginAttempt(options)
+      login = { url: "", finish: (_code, opts) => attempt.submit(async active => {
+        const token = await tokenLogin(inputs, config, { signal: active })
+        return complete(token, active)
+      }, opts) }
+    } else login = await configuredLogin(config, options)
+    if (login.error) throw new Error(login.error)
+    return {
+      url: login.url,
+      instructions: tokens ? "" : "Open the authorization link manually. Paste the complete callback URL to validate its state, or paste the authorization code from this attempt. No local listener is needed. The link expires after 15 minutes.",
+      method: tokens ? "auto" : "code",
+      callback: signInCallback(login, account, { signal }),
+    }
+  } catch (error) {
+    if (account) dropHome(account.home)
+    return { type: "failed", error: error.message }
   }
 }
 
@@ -6740,9 +6784,7 @@ async function importSignIns(texts, { signal } = {}) {
       try {
         account = newHome()
         created.push(account.home)
-        const file = tokenFile(account.home)
-        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-        fs.writeFileSync(file, tokenFileText(a), { mode: 0o600 })
+        writeTokenFile(account.home, tokenFileText(a))
       } catch (error) {
         if (account) dropHome(account.home)
         out.push(failed(`couldn't make a folder for the account: ${error.message}`))
@@ -6750,14 +6792,7 @@ async function importSignIns(texts, { signal } = {}) {
       }
       out.push(await inAccount(account.home, async () => {
         try {
-          forgetStoredSignIn()
-          forgetOffered()
-          const probe = await probeSignedIn(agy, { signal })
-          if (!probe.ok) {
-            dropHome(account.home)
-            return failed(`agy couldn't sign in with it: ${probe.why}`)
-          }
-          return await signedInAs(account.id)
+          return await completeSignIn(agy, account, { signal })
         } catch (error) {
           dropHome(account.home)
           return failed(`agy couldn't sign in with it: ${error.message}`)
@@ -6816,11 +6851,8 @@ export const AntigravityBridgePlugin = async () => {
       import: (texts, options) => importSignIns(Array.isArray(texts) ? texts : [texts], options),
       methods: [
         {
-          // agy's own Google sign-in (`agy acp --login`): magpie opens its
-          // link and takes the code the page shows. agy keeps the token;
-          // the plugin's account is only "agy", saved once agy says the
-          // sign-in took and lists the account's models. Signed in to agy
-          // already, nothing opens: the account agy has is the one saved.
+          // Reuse agy's current sign-in, or start native manual login in a
+          // new home without changing the user's original credentials.
           type: "oauth",
           label: "Sign in with Google",
           labels: { zh: "使用 Google 登录", "zh-TW": "使用 Google 登入", ja: "Google でサインイン" },
@@ -6828,10 +6860,15 @@ export const AntigravityBridgePlugin = async () => {
             if (signal?.aborted) return { type: "failed", error: "the sign-in was cancelled" }
             const agy = findAgy()
             if (!agy) return noAgy()
-            if ((await probeSignedIn(agy, { signal })).ok) {
-              return { url: "", instructions: "", method: "auto", callback: async () => signedInAs() }
+            try {
+              if ((await probeSignedIn(agy, { signal })).ok) {
+                return { url: "", instructions: "", method: "auto", callback: async () => signedInAs() }
+              }
+              signal?.throwIfAborted()
+              return googleSignIn(agy, newHome(), { signal, key: "agy" })
+            } catch (error) {
+              return { type: "failed", error: error.message }
             }
-            return googleSignIn(agy, null, { signal })
           },
         },
         {
@@ -6855,6 +6892,20 @@ export const AntigravityBridgePlugin = async () => {
             }
             return googleSignIn(agy, account, { signal })
           },
+        },
+        {
+          type: "oauth",
+          label: "OAuth configuration authorization login",
+          labels: { zh: "OAuth 配置授权登录", "zh-TW": "OAuth 設定授權登入", ja: "OAuth 設定で認証" },
+          prompts: CODE_PROMPTS,
+          authorize: (inputs, options) => oauthSignIn(inputs, options),
+        },
+        {
+          type: "oauth",
+          label: "Sign in with OAuth tokens",
+          labels: { zh: "填写 OAuth Token 登录", "zh-TW": "填寫 OAuth Token 登入", ja: "OAuth トークンでサインイン" },
+          prompts: TOKEN_PROMPTS,
+          authorize: (inputs, options) => oauthSignIn(inputs, { ...options, tokens: true }),
         },
       ],
       loader: async (getAuth) => {

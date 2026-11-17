@@ -618,7 +618,7 @@ export async function createBridgeKit(options = {}) {
   const importUrl = pathToFileURL(IMPORT_FILE).href
   const documentsUrl = pathToFileURL(DOCUMENTS_FILE).href
   const linker = (specifier) => {
-    const key = specifier.startsWith("node:") || specifier.startsWith("./") || specifier === RUNTIME_SPECIFIER
+    const key = specifier.startsWith("node:") || specifier.startsWith("./") || specifier === "oauth4webapi" || specifier === RUNTIME_SPECIFIER
       ? specifier
       : `node:${specifier}`
     if (cache.has(key)) return cache.get(key)
@@ -639,6 +639,8 @@ export async function createBridgeKit(options = {}) {
     else if (key === "./account.mjs") module = sourceModule(ACCOUNT_FILE, "", accountUrl)
     else if (key === "./import.mjs") module = sourceModule(IMPORT_FILE, "", importUrl)
     else if (key === "./documents.mjs") module = sourceModule(DOCUMENTS_FILE, "", documentsUrl)
+    else if (key === "./oauth.mjs") module = sourceModule(path.join(REPO_DIR, "oauth.mjs"), "", pathToFileURL(path.join(REPO_DIR, "oauth.mjs")).href)
+    else if (key === "oauth4webapi") module = builtinModule(key)
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
     else throw new Error(`testkit: 未登记的依赖 ${specifier}`)
     cache.set(key, module)

@@ -57,13 +57,30 @@ export function tokenFile(home) {
   return path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
 }
 
-// accountEnv is what an agy for the account at home is started with.
+export function adcFile(home) {
+  return path.join(home, ".gemini", "antigravity-cli", "oauth-client.json")
+}
+
+// Both imports and interactive login write through this account-home owner.
+// The consumer snapshot also supplies the account name and direct quota read.
+export function writeTokenFile(home, text, adc = null) {
+  const file = tokenFile(home)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  if (adc) fs.writeFileSync(adcFile(home), JSON.stringify(adc), { mode: 0o600 })
+  fs.writeFileSync(file, text, { mode: 0o600 })
+}
+
+// accountEnv is what every CLI path (models, usage and ACP) consumes.
 export function accountEnv(home, platform = process.platform) {
+  const adc = fs.existsSync(adcFile(home))
   return {
     HOME: home,
     ...(platform === "win32" ? { USERPROFILE: home } : {}),
-    // agy keeps its sign-in in tokenFile(home), not the keyring
     SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 0",
+    // decision: custom Google clients use agy's native ADC authorized_user;
+    // not consumer token JSON because it cannot express a custom OAuth client.
+    // Isolated native tracer: custom client refresh -> Code Assist bearer.
+    ...(adc ? { AGY_ADC_AUTH: "true", GOOGLE_APPLICATION_CREDENTIALS: adcFile(home) } : {}),
   }
 }
 

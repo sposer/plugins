@@ -13,8 +13,8 @@ OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放�
 流式响应。
 
 - 底层是真正的 agy CLI，走它自带的 ACP 通道。ACP 握手里的 `clientInfo` 是本插件自己的
-  包名和版本（`opencode-agy-cli-auth`），不冒充 Zed 或其它编辑器。插件自己只在一种情况下请求 Google
-  的接口：agy 因地区拒绝 `/usage` 时，按 agy 的方式读额度（见「额度」）。
+  包名和版本（`opencode-agy-cli-auth`），不冒充 Zed 或其它编辑器。插件在配置 OAuth 登录时完成
+  Google 授权交换与账号验证；agy 因地区拒绝 `/usage` 时，也按 agy 的方式读额度（见「额度」）。
 - 客户端自己的工具（读写文件、执行命令等）通过 MCP 暴露给模型。工具由客户端执行，结果
   回传到同一轮 agy 对话里，模型看到的是原生工具调用。
 - 账号风险不由插件决定。Google 的使用政策变化时，插件无法替你保证账号不受限制。
@@ -121,23 +121,30 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 
 ## 使用
 
-1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in。agy 已经登录时直接完成；
-   没登录时插件运行 agy 自己的 Google 登录（`agy acp --login`），Magpie 打开登录页，
-   登录后把页面显示的授权码（或整个页面地址）粘贴回 Magpie。Magpie 在服务器或 Docker
-   里也一样。登录的有效期是 15 分钟，取消会结束登录进程，再次登录会替换旧链接。
-   OAuth 交换仍由 agy 完成，凭据保存在本机钥匙串或 agy 的令牌文件里；agy 列出账号的模型
-   （`agy models`）后才算登录成功。账号在 Magpie 里以 agy 存的 Google 邮箱命名。
-   要再加一个 Google 账号，点 agy-cli 的 Add another account（或 Sign in），选「添加另一个
-   Google 账号」。新账号有自己的 agy 主目录（`~/.local/state/magpie-agy-bridge/accounts/`
-   下），它的登录保存在那个目录里的文件中，不动系统钥匙串里原来那个账号。每个账号单独一行，
-   用量分开显示，可以像其他 provider 的账号一样切换和轮换。登录失败、取消、过期或被新登录
-   替换时，未完成账号的目录会被删除，已有账号不受影响。
-   用过已退役的 Antigravity 插件（`antigravity`）的话，Magpie 的 Providers 页顶上会提示把那里的
-   账号移过来，点 Move 即可；也可以在 agy-cli 的 Import accounts from a file… 里选那份登录记录
-   或 agy 的令牌文件，也支持 sub2api 的账号导出 JSON：只导入 `platform: "antigravity"`、
-   `type: "oauth"` 且 `credentials` 中有 `refresh_token` 的账号，其他平台和 API key 账号会跳过。
-   每个账号放进自己的 agy 主目录，由 agy 检查通过后才加入；相同令牌只检查一次，已有邮箱不会重复添加。
-   取消整批导入会删除本批尚未保存的账号目录，保留已有账号。
+1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in，选择登录方式：
+   - **使用 Google 登录**：agy 已登录时直接使用现有账号；否则运行原生 `agy acp --login`，
+     从提示中复制链接、手动打开，登录后粘贴授权码或完整回调 URL
+   - **添加另一个 Google 账号**：始终开始一次新的原生登录，已有账号保持不变
+   - **OAuth 配置授权登录**：按表单填写 `client_id`、`client_secret`、已注册的 `redirect_uri`
+     和空格分隔的 `scope`；留空使用现行 agy Google 客户端及其默认回调、权限。自定义
+     `client_id` 需同时填写对应的 `client_secret`。手动打开生成的链接，再粘贴授权码或完整
+     回调 URL；完整 URL 会校验返回的 state，授权码绑定本次 PKCE verifier，不启动本地监听
+   - **填写 OAuth Token 登录**：单独填写 `refresh_token`、对应的客户端配置，以及可选的
+     `access_token`、`expiry`、`email`，不需要 JSON 或账号导出。`expiry` 接受 ISO 日期或 Unix
+     秒/毫秒；保存前始终执行 refresh grant，使用返回的新令牌，确认该客户端能持续续期
+
+   登录不会自动打开浏览器。[Google 官方 SSH 登录流程](https://antigravity.google/docs/install/#remote-ssh-oauth-flow)
+   用于原生登录子进程，后台运行方式不变。链接有效期为 15 分钟；取消、失败、过期或开始新登录
+   会释放未完成账号的目录、进程和等待，重复回调不会删除已保存账号。每个新登录账号使用
+   `~/.local/state/magpie-agy-bridge/accounts/`（或 `$XDG_STATE_HOME` 对应位置）下独立的 agy
+   主目录，不改用户原有凭据；agy 列出账号模型后才保存。每个账号的用量、模型和请求使用同一个 home。
+   默认客户端使用原生 consumer token 文件；自定义 Google 客户端通过 agy 原生 ADC
+   `authorized_user` 文件保存 client 与 refresh token，并由 CLI 续期，已在 agy 1.5.10 的隔离
+   假端点上验证。模型订阅资格仍由 agy 和 Google 判定，不把登录成功当成模型可用。
+
+   已退役 Antigravity 插件（`antigravity`）的账号仍可点 Move 迁入；Import accounts from a file…
+   接受那份登录记录或 agy 的 `antigravity-oauth-token` 文件。每个账号由 agy 检查后才加入，
+   相同令牌只检查一次，已有邮箱不会重复添加；取消整批导入会删除本批未保存目录，保留已有账号。
 2. 模型名写成 `agy-cli/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
 3. 在客户端里选用这个模型即可。
@@ -164,7 +171,7 @@ magpie quota refresh agy-cli --json
 ```
 
 额度数据来自 agy 自己的 `/usage` 报告，显示的是当前 agy 登录账号的订阅窗口，按模型组
-分别列出。插件不写 Google 令牌，也只把它发往 Google，查询的始终是 agy 当前登录的账号。没有可测量数据的窗口会显示
+分别列出。额度读取不改写账号凭据，令牌只发往 Google，查询使用该账号的 agy home。没有可测量数据的窗口会显示
 "Limits not available"，而不是 0% 或 100%。
 
 在 Antigravity 未开放的地区，agy 会在资格检查时拒绝 `/usage`（"not currently available in

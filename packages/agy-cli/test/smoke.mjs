@@ -52,7 +52,7 @@ import readline from "node:readline"
 const argv = process.argv.slice(2)
 // where agy's home is (HOME, USERPROFILE on Windows) and whether it keeps
 // its sign-in in a file there (SSH_CONNECTION: agy reads it as SSH)
-const where = { home: os.homedir(), ssh: process.env.SSH_CONNECTION ?? null }
+const where = { home: os.homedir(), ssh: process.env.SSH_CONNECTION ?? null, adc: process.env.AGY_ADC_AUTH, credentials: process.env.GOOGLE_APPLICATION_CREDENTIALS }
 const log = value => fs.appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify({ ...where, ...value }) + "\n")
 const send = value => process.stdout.write(JSON.stringify(value) + "\n")
 
@@ -76,12 +76,12 @@ if (argv[0] === "acp" && argv.includes("--login")) {
   if (/^(good-code|https:\/\/antigravity\.google\/oauth-callback\?code=good-code(&.*)?)$/.test(line.trim())) {
     if (!fs.existsSync(path.join(process.env.FAKE_AGY_STATE, "login-keeps-signed-out"))) fs.rmSync(signedOut, { force: true })
     // agy with no keyring to use keeps the sign-in in a file in its home
-    if (process.env.FAKE_AGY_FILE_EMAIL && where.ssh) {
+    if (where.ssh) {
       const dir = path.join(where.home, ".gemini", "antigravity-cli")
       fs.mkdirSync(dir, { recursive: true })
       fs.writeFileSync(path.join(dir, "antigravity-oauth-token"), JSON.stringify({
         token: { access_token: "ya29.fake", token_type: "Bearer", refresh_token: "1//fake", expiry: "2099-01-01T00:00:00Z" },
-        auth_method: "consumer", id_token_email: process.env.FAKE_AGY_FILE_EMAIL,
+        auth_method: "consumer", id_token_email: process.env.FAKE_AGY_FILE_EMAIL || "test@example.com",
       }))
     }
     process.stdout.write("Logged in as test@example.com.\n")
@@ -783,7 +783,7 @@ const legacyModel = "agy-cli/gemini-test-low"
   const before = logs().filter(event => event.type === "models").length
   const result = await plugin.auth.methods[0].authorize()
   const probes = logs().filter(event => event.type === "models").slice(before)
-  check("sign-in is agy's Google sign-in, an oauth way, and a way to add another account", plugin.auth.methods.length === 2 && plugin.auth.methods.every(m => m.type === "oauth"))
+  check("native Google and both configured OAuth login methods are available", plugin.auth.methods.length === 4 && plugin.auth.methods.every(m => m.type === "oauth"))
   check("signed in to agy already, the sign-in opens nothing", result.url === "" && result.method === "auto")
   check("signed in to agy already, the sign-in saves agy", (await result.callback())?.type === "success")
   check("authorize login probe disables auto update", probes.length === 1 && probes[0].update === "true")
@@ -806,7 +806,7 @@ const legacyModel = "agy-cli/gemini-test-low"
     check("more than one account may be signed in", plugin.auth.single !== true)
     const before = logs().filter(event => event.type === "login").length
     const a = await adder.authorize()
-    check("signed in already, adding an account still opens Google's link", /^https:\/\/accounts\.google\.com\//.test(a.url ?? "") && a.method === "code", JSON.stringify(a))
+    check("adding an account provides its complete manual authorization link", a.url?.startsWith("https://accounts.google.com/") && a.method === "code", JSON.stringify(a))
     const login = logs().filter(event => event.type === "login")
     check("adding an account runs agy's own sign-in", login.length === before + 1)
     const accounts = path.join(xdg, "magpie-agy-bridge", "accounts")
@@ -920,35 +920,19 @@ const legacyModel = "agy-cli/gemini-test-low"
     const fromFile = await plugin.auth.import(["go-keyring-base64:" + Buffer.from(agyOwn).toString("base64")])
     check("agy's own stored sign-in is taken too", fromFile?.[0]?.type === "success" && fromFile[0].metadata?.email === "own-c@example.com", JSON.stringify(fromFile))
 
-    const exported = {
-      type: "sub2api-data", version: 1, exported_at: "2026-11-17T00:00:00Z", proxies: [],
-      accounts: [
-        { platform: "gemini", type: "oauth", credentials: { refresh_token: "1//other-google-client" } },
-        { platform: "antigravity", type: "apikey", credentials: { refresh_token: "1//not-oauth" } },
-        { platform: "antigravity", type: "oauth", credentials: { refresh_token: "1//sub2api", access_token: "ya29.export", expires_at: "1800000000", email: "export@example.com", project_id: "project" } },
-      ],
-    }
-    const fromSub2api = await plugin.auth.import([JSON.stringify(exported), JSON.stringify(exported.accounts[2])])
-    check("sub2api exports import only Antigravity OAuth accounts and deduplicate tokens",
-      Array.isArray(fromSub2api) && fromSub2api.length === 1 && fromSub2api[0]?.type === "success" && fromSub2api[0].metadata?.email === "export@example.com", JSON.stringify(fromSub2api))
-    const exportHome = path.join(accounts, fromSub2api[0]?.metadata?.agyHome ?? "none")
-    const exportToken = JSON.parse(fs.readFileSync(path.join(exportHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "utf8"))
-    check("sub2api credentials use Unix seconds and become agy's native token file",
-      exportToken.token?.refresh_token === "1//sub2api" && exportToken.token.access_token === "ya29.export" && exportToken.token.expiry === "2027-01-15T08:00:00.000Z")
-
-    const other = await plugin.auth.import([JSON.stringify({ refresh_token: "1//someone-else", client_id: "x.apps.googleusercontent.com" }), "1//bare-token", JSON.stringify(exported.accounts.slice(0, 2))])
-    check("other providers, non-OAuth exports and unlabelled refresh tokens aren't taken", other?.type === "failed", JSON.stringify(other))
+    const other = await plugin.auth.import([JSON.stringify({ refresh_token: "1//someone-else", client_id: "x.apps.googleusercontent.com" }), "1//bare-token"])
+    check("unlabelled refresh tokens aren't taken as native imports", other?.type === "failed", JSON.stringify(other))
 
     const controller = new AbortController()
     controller.abort()
     const before = fs.readdirSync(accounts).length
-    const stopped = await plugin.auth.import([JSON.stringify(exported)], { signal: controller.signal })
+    const stopped = await plugin.auth.import([JSON.stringify(old)], { signal: controller.signal })
     check("an already cancelled import creates no account home", stopped?.type === "failed" && fs.readdirSync(accounts).length === before)
 
     const importing = new AbortController()
     const pending = plugin.auth.import([JSON.stringify([
-      { platform: "antigravity", type: "oauth", credentials: { refresh_token: "1//batch-first", email: "batch-first@example.com" } },
-      { platform: "antigravity", type: "oauth", credentials: { refresh_token: "1//cancel-import", email: "cancel-import@example.com" } },
+      { type: "oauth", refresh: "1//batch-first|project", accountId: "batch-first@example.com" },
+      { type: "oauth", refresh: "1//cancel-import|project", accountId: "cancel-import@example.com" },
     ])], { signal: importing.signal })
     // The second probe waits until killed, after the first account succeeded.
     for (let i = 0; i < 200 && !logs().some(event => event.waiting); i++) await new Promise(resolve => setTimeout(resolve, 25))
@@ -966,7 +950,7 @@ const legacyModel = "agy-cli/gemini-test-low"
 
     const offeredController = new AbortController()
     const offeredPending = plugin.auth.import([JSON.stringify({
-      platform: "antigravity", type: "oauth", credentials: { refresh_token: "1//cancel-offered", email: "cancel-offered@example.com" },
+      type: "oauth", refresh: "1//cancel-offered|project", accountId: "cancel-offered@example.com",
     })], { signal: offeredController.signal })
     for (let i = 0; i < 200 && !logs().some(event => event.type === "offered-wait"); i++) await new Promise(resolve => setTimeout(resolve, 25))
     const offered = logs().find(event => event.type === "offered-wait")
@@ -985,35 +969,68 @@ const legacyModel = "agy-cli/gemini-test-low"
 }
 
 {
+  const savedState = process.env.XDG_STATE_HOME
+  const savedFetch = globalThis.fetch
+  process.env.XDG_STATE_HOME = path.join(stateDir, "oauth-state")
+  globalThis.fetch = async (url) => {
+    if (String(url) !== "https://oauth2.googleapis.com/token") throw new Error("unexpected network request")
+    return new Response(JSON.stringify({ access_token: "sandbox-access", token_type: "Bearer", expires_in: 3600 }), { headers: { "Content-Type": "application/json" } })
+  }
+  try {
+    const login = await plugin.auth.methods[3].authorize({
+      refresh_token: "sandbox-refresh", client_id: "sandbox-client", client_secret: "sandbox-secret", email: "adc@example.com",
+    })
+    const result = await login.callback()
+    check("entered custom-client tokens pass native account verification", result.type === "success", JSON.stringify(result))
+    const before = logs().filter(event => event.type === "usage").length
+    const usage = await plugin.auth.usage(async () => result, {})
+    const runs = logs().filter(event => event.type === "usage").slice(before)
+    const home = path.join(process.env.XDG_STATE_HOME, "magpie-agy-bridge", "accounts", result.metadata?.agyHome ?? "")
+    check("custom-client quota runs with the same native ADC account", usage.windows?.length > 0 && runs.length === 1 && runs[0].home === home && runs[0].adc === "true" && runs[0].credentials === path.join(home, ".gemini", "antigravity-cli", "oauth-client.json"), JSON.stringify(runs))
+  } finally {
+    globalThis.fetch = savedFetch
+    if (savedState === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = savedState
+  }
+}
+
+{
   // signed out: agy's own sign-in gives the link and takes the pasted code
-  const signedOut = path.join(stateDir, "signed-out")
-  fs.writeFileSync(signedOut, "")
-  const auth = plugin.auth.methods[0]
-  const a = await auth.authorize()
-  check("signed out, the sign-in opens Google's link agy printed", /^https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?/.test(a.url ?? ""), JSON.stringify(a))
-  check("signed out, the sign-in takes the code the page shows", a.method === "code" && typeof a.callback === "function")
-  check("agy's sign-in runs with auto update off", logs().filter(event => event.type === "login").at(-1)?.update === "true")
-  const bad = await a.callback("4/wrong-code")
-  check("a code Google turns away saves nothing", bad?.type === "failed" && /turned the code away/.test(bad.error ?? ""), JSON.stringify(bad))
-  check("agy is handed the pasted code", logs().filter(event => event.type === "login-code").at(-1)?.code === "4/wrong-code")
-  check("still signed out after a turned-away code", fs.existsSync(signedOut))
+  const savedState = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = path.join(stateDir, "first-login-state")
+  try {
+    const signedOut = path.join(stateDir, "signed-out")
+    fs.writeFileSync(signedOut, "")
+    const auth = plugin.auth.methods[0]
+    const a = await auth.authorize()
+    check("signed out, agy returns its full manual authorization URL", a.url?.startsWith("https://accounts.google.com/o/oauth2/auth?"), JSON.stringify(a))
+    check("signed out, the sign-in takes the code the page shows", a.method === "code" && typeof a.callback === "function")
+    check("agy's sign-in runs with auto update off", logs().filter(event => event.type === "login").at(-1)?.update === "true")
+    const bad = await a.callback("4/wrong-code")
+    check("a code Google turns away saves nothing", bad?.type === "failed" && !fs.existsSync(logs().filter(event => event.type === "login").at(-1)?.home ?? ""), JSON.stringify(bad))
+    check("agy is handed the pasted code", logs().filter(event => event.type === "login-code").at(-1)?.code === "4/wrong-code")
+    check("still signed out after a turned-away code", fs.existsSync(signedOut))
 
-  const empty = await (await auth.authorize()).callback("  ")
-  check("an empty code saves nothing", empty?.type === "failed", JSON.stringify(empty))
+    const empty = await (await auth.authorize()).callback("  ")
+    check("an empty code saves nothing", empty?.type === "failed", JSON.stringify(empty))
 
-  const b = await auth.authorize()
-  const good = await b.callback("https://antigravity.google/oauth-callback?code=good-code&scope=x")
-  check("the page's whole address signs agy in", good?.type === "success" && good.key === "agy", JSON.stringify(good))
-  check("signed in, agy lists models again", !fs.existsSync(signedOut))
+    const b = await auth.authorize()
+    const good = await b.callback("https://antigravity.google/oauth-callback?code=good-code&scope=x")
+    check("the page's whole address signs agy in with an independent home", good?.type === "success" && good.key === "agy" && !!good.metadata?.agyHome, JSON.stringify(good))
+    check("signed in, agy lists models again", !fs.existsSync(signedOut))
 
-  // agy that says it signed in but still lists no models saves nothing
-  fs.writeFileSync(signedOut, "")
-  const c = await auth.authorize()
-  fs.writeFileSync(path.join(stateDir, "login-keeps-signed-out"), "")
-  const odd = await c.callback("good-code")
-  fs.rmSync(path.join(stateDir, "login-keeps-signed-out"), { force: true })
-  check("agy saying it signed in while listing nothing saves nothing", odd?.type === "failed" && /agy models/.test(odd.error ?? ""), JSON.stringify(odd))
-  fs.rmSync(signedOut, { force: true })
+    // agy that says it signed in but still lists no models saves nothing
+    fs.writeFileSync(signedOut, "")
+    const c = await auth.authorize()
+    fs.writeFileSync(path.join(stateDir, "login-keeps-signed-out"), "")
+    const odd = await c.callback("good-code")
+    fs.rmSync(path.join(stateDir, "login-keeps-signed-out"), { force: true })
+    check("agy saying it signed in while listing nothing saves nothing", odd?.type === "failed" && !fs.existsSync(logs().filter(event => event.type === "login").at(-1)?.home ?? ""), JSON.stringify(odd))
+    fs.rmSync(signedOut, { force: true })
+  } finally {
+    if (savedState === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = savedState
+  }
 }
 
 async function launchedModel(body) {

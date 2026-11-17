@@ -11,8 +11,9 @@ const LINK = "https://accounts.google.com/o/oauth2/v2/auth?client_id=test&state=
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
 function fixture() {
-  childProcess.spawn = () => {
+  childProcess.spawn = (file, args, options) => {
     const child = new EventEmitter()
+    child.launch = { file, args, options }
     child.stdout = new EventEmitter()
     child.stderr = new EventEmitter()
     child.stdout.setEncoding = child.stderr.setEncoding = () => {}
@@ -54,6 +55,8 @@ test("the complete sign-in link is collected across stdout and stderr chunks", a
   fixture()
   const pending = startLogin("agy")
   const child = children.at(-1)
+  assert.equal(child.launch.options.env.SSH_CONNECTION, "127.0.0.1 0 127.0.0.1 0")
+  assert.deepEqual(child.launch.args, ["acp", "--login"])
   let settled = false
   pending.then(() => { settled = true })
   child.stdout.emit("data", "\u001b[32m" + LINK.slice(0, 50))

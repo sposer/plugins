@@ -10,9 +10,7 @@
 //     the access token, its expiry (ms) and the email as accountId; one,
 //     a list, or a map of them (magpie's plugin-auth.json);
 //   - agy's own stored sign-in, the JSON of its token file
-//     ({"token":{access_token, refresh_token, expiry, …}, "id_token_email"});
-//   - sub2api's Antigravity OAuth account, identified by platform and type,
-//     with refresh_token and expires_at (Unix seconds) under credentials.
+//     ({"token":{access_token, refresh_token, expiry, …}, "id_token_email"}).
 // An unlabelled refresh token may be another client's, so it isn't taken.
 //
 // Each account becomes the value agy keeps in its token file
@@ -51,22 +49,6 @@ function fromAgy(v) {
   }
 }
 
-// sub2api uses the same installed-app client for its Antigravity OAuth
-// accounts. Platform and type distinguish them from its other providers.
-function fromSub2api(v) {
-  if (v?.platform !== "antigravity" || v.type !== "oauth") return null
-  const t = v.credentials
-  const refresh = str(t?.refresh_token)
-  if (!refresh) return null
-  const expires = Number(t.expires_at) * 1000
-  return {
-    email: str(t.email),
-    refresh,
-    access: str(t.access_token),
-    expires: Number.isFinite(expires) && expires > 0 ? expires : 0,
-  }
-}
-
 function decode(text) {
   let value = String(text ?? "").trim()
   if (value.startsWith("go-keyring-base64:")) value = Buffer.from(value.slice(18), "base64").toString("utf8")
@@ -85,7 +67,7 @@ export function importedAccounts(texts) {
   }
   const walk = (v, depth) => {
     if (!v || typeof v !== "object" || depth > 2) return
-    const a = fromSub2api(v) ?? fromPlugin(v) ?? fromAgy(v)
+    const a = fromPlugin(v) ?? fromAgy(v)
     if (a) return add(a)
     for (const x of Array.isArray(v) ? v : Object.values(v)) walk(x, depth + 1)
   }
@@ -111,10 +93,10 @@ export function tokenFileText(a) {
 
 // IMPORT_FROM says what magpie's "Import accounts from a file…" takes.
 export const IMPORT_FROM = {
-  en: "Choose or paste the retired Antigravity plugin's sign-in, agy's token file (antigravity-oauth-token), or a sub2api export of Antigravity OAuth accounts. Each account is checked with agy before it is added.",
+  en: "Choose or paste the retired Antigravity plugin's sign-in or agy's token file (antigravity-oauth-token). Each account is checked with agy before it is added.",
   froms: {
-    zh: "选择或粘贴已退役 Antigravity 插件的登录记录、agy 的令牌文件 antigravity-oauth-token，或 sub2api 导出的 Antigravity OAuth 账号。每个账号先由 agy 检查再添加。",
-    "zh-TW": "選擇或貼上已退役 Antigravity 外掛的登入記錄、agy 的權杖檔 antigravity-oauth-token，或 sub2api 匯出的 Antigravity OAuth 帳號。每個帳號先由 agy 檢查再加入。",
-    ja: "旧 Antigravity プラグインのサインイン、agy のトークンファイル antigravity-oauth-token、または sub2api の Antigravity OAuth アカウントを選ぶか貼り付けてください。各アカウントは追加前に agy で確認します。",
+    zh: "选择或粘贴已退役 Antigravity 插件的登录记录，或 agy 的令牌文件 antigravity-oauth-token。每个账号先由 agy 检查再添加。",
+    "zh-TW": "選擇或貼上已退役 Antigravity 外掛的登入記錄，或 agy 的權杖檔 antigravity-oauth-token。每個帳號先由 agy 檢查再加入。",
+    ja: "旧 Antigravity プラグインのサインインか agy のトークンファイル antigravity-oauth-token を選ぶか貼り付けてください。各アカウントは追加前に agy で確認します。",
   },
 }

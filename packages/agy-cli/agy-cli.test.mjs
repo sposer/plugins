@@ -21,6 +21,7 @@ for (const [name, mocks] of [
   ["usage.mjs", true],
   ["signin.mjs", false],
   ["login.mjs", true],
+  ["oauth.mjs", false],
   ["catalog.mjs", false],
   ["step-usage.mjs", false],
   ["tool-schema.mjs", false],

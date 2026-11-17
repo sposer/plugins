@@ -1,11 +1,12 @@
 {
   "name": "@magpie-community/opencode-grok-auth",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "OpenCode provider plugin: Grok (SuperGrok / X Premium+) through the Grok Build CLI's sign-in",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": { ".": "./opencode2.mjs" },
-  "files": ["index.mjs", "opencode.mjs", "opencode2.mjs", "README.md"],
+  "files": ["index.mjs", "oauth.mjs", "opencode.mjs", "opencode2.mjs", "README.md"],
+  "dependencies": { "oauth4webapi": "3.8.8" },
   "keywords": ["opencode", "opencode-plugin", "grok", "xai", "supergrok"],
   "license": "MIT",
   "repository": {

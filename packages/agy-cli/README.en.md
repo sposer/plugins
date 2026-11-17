@@ -18,9 +18,9 @@ response.
 - The work is done by the real agy CLI over the ACP channel it ships with. The
   ACP handshake's `clientInfo` is the plugin's own package name and version
   (`opencode-agy-cli-auth`), not Zed or any other editor. The plugin calls
-  Google's endpoints itself in one case only: when agy refuses `/usage` for
-  the account's region, it reads the quota the way agy does (see "Usage
-  quota").
+  Google for configured OAuth login and account validation, and reads quota
+  the way agy does when it refuses `/usage` for the account's region (see
+  "Usage quota").
 - Tools that belong to the client, such as file reads, writes and shell commands,
   are exposed to the model over MCP. The client runs them and the results flow
   back into the same agy conversation, so the model sees ordinary native tool
@@ -173,33 +173,44 @@ After installing, sign in from Magpie; no terminal needed.
 
 ## Usage
 
-1. Open Magpie's Providers page, find `agy-cli`, and click Sign in. If agy is
-   signed in already, that's all. If not, the plugin runs agy's own Google
-   sign-in (`agy acp --login`): Magpie opens the sign-in page, and you paste the
-   code the page shows (or the page's whole address) back into Magpie. This
-   works with Magpie on a server or in Docker too. The sign-in waits 15
-   minutes; cancelling stops the login process, and starting again replaces
-   the old link. agy still performs the OAuth exchange, and credentials stay
-   in the local keyring or agy's token file. The sign-in is done only once
-   `agy models` lists the account's models. Magpie names the account by the
-   Google email agy stored.
-   To add another Google account, click agy-cli's Add another account (or
-   Sign in) and pick "Add another Google account". The new account gets an
-   agy home of its own (under `~/.local/state/magpie-agy-bridge/accounts/`),
-   and agy keeps its sign-in in a file there, leaving the account in the
-   system keyring as it is. Each account has its own row and its own usage,
-   and is switched and rotated like any provider's accounts. Failure,
-   cancellation, expiry or a replacement sign-in removes the unfinished
-   account's folder, leaving existing accounts alone.
-   Accounts signed in on the retired Antigravity plugin (`antigravity`) move
-   over from the line Magpie shows over its Providers list (Move), or from
-   agy-cli's Import accounts from a file…, which takes that plugin's sign-in,
-   agy's token file, or a sub2api account export. A sub2api account must have
-   `platform: "antigravity"`, `type: "oauth"` and a `credentials.refresh_token`;
-   other providers and API key accounts are skipped. Each gets its own agy
-   home and is added once agy checks it. A token is checked once, and an
-   existing email is not added again. Cancelling a batch removes its unsaved
-   account folders, leaving existing accounts alone.
+1. Open Magpie's Providers page, find `agy-cli`, click Sign in and choose:
+   - **Sign in with Google**: use agy's existing sign-in, or start native
+     `agy acp --login`. Copy the displayed link, open it manually, then paste
+     the authorization code or complete callback URL
+   - **Add another Google account**: always start a new native sign-in,
+     leaving existing accounts unchanged
+   - **OAuth configuration authorization login**: enter `client_id`,
+     `client_secret`, the registered `redirect_uri` and space-separated
+     `scope`. Blank fields use agy's current Google client, callback and
+     scopes; a custom client ID needs its corresponding secret. Open the
+     generated link manually, then paste the code or complete callback URL.
+     A full URL validates the returned state; a bare code is bound to this
+     attempt's PKCE verifier. No local callback listener is started
+   - **Sign in with OAuth tokens**: enter `refresh_token`, its client
+     configuration, and optional `access_token`, `expiry` and `email` as
+     separate fields, with no JSON or account export. Expiry accepts an ISO
+     date or Unix seconds/milliseconds. The refresh grant is always checked
+     before saving, and its fresh tokens replace any supplied access token
+
+   Login never opens a browser automatically. Native login children use
+   [Google's documented SSH flow](https://antigravity.google/docs/install/#remote-ssh-oauth-flow);
+   background execution is unchanged. Links last 15 minutes. Cancellation,
+   failure, expiry or another login releases the unfinished home, process and
+   waits; a repeated callback cannot delete a saved account. New sign-ins
+   get independent agy homes under `~/.local/state/magpie-agy-bridge/accounts/`
+   (or the corresponding `$XDG_STATE_HOME`), without changing original user
+   credentials. An account is saved only after agy lists its models. Usage,
+   model listings and requests all run in that same home. The default client
+   uses native consumer tokens; custom Google clients use agy's native ADC
+   `authorized_user` file, retaining their client configuration and refresh
+   token for CLI-owned renewal. This was checked with isolated fake endpoints
+   on agy 1.5.10. Model eligibility remains agy's and Google's decision.
+
+   Accounts from the retired Antigravity plugin (`antigravity`) still move
+   over with Move. Import accounts from a file… takes that plugin's sign-in
+   or agy's `antigravity-oauth-token` file. Each account is checked by agy;
+   tokens are deduplicated, and an existing email is not added again.
+   Cancelling a batch removes its unsaved homes, leaving existing accounts alone.
 2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
    for different thinking levels, they are grouped here as variants of one model,
    and each request is mapped back to the matching agy ID.
@@ -232,8 +243,8 @@ magpie quota refresh agy-cli --json
 ```
 
 The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. The plugin never writes Google tokens
-or sends them anywhere but Google; it always reports the account agy is signed in to. A window with no
+in to the CLI, broken down by model group. Quota reads do not rewrite account
+credentials, send tokens only to Google and use that account's agy home. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
 Where Antigravity isn't offered, agy refuses `/usage` on its eligibility check

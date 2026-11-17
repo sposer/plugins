@@ -941,6 +941,29 @@ test("an access token about to end is renewed in memory for the direct read, nev
   assert.equal(ending.token.access_token, "ya29.live")
 })
 
+test("an ADC account's direct quota refresh uses its own OAuth client", async t => {
+  const api = await codeAssist(t)
+  const oauth = { client_id: "custom-client", client_secret: "custom-secret", token_uri: "https://oauth2.googleapis.com/token" }
+  const ending = structuredClone(STORED)
+  ending.oauth = oauth
+  ending.auth_method = "adc"
+  ending.token.expiry = new Date(Date.now() - 1).toISOString()
+  const fetchFn = async (url, init) => {
+    if (String(url) === oauth.token_uri) {
+      const form = new URLSearchParams(init.body)
+      assert.equal(form.get("client_id"), oauth.client_id)
+      assert.equal(form.get("client_secret"), oauth.client_secret)
+      assert.equal(form.get("refresh_token"), ending.token.refresh_token)
+      return new Response(JSON.stringify({ access_token: "adc-fresh", token_type: "Bearer", expires_in: 3600 }), { headers: { "Content-Type": "application/json" } })
+    }
+    return fetch(url, init)
+  }
+  const data = await readQuotaDirect({ env: { CLOUD_CODE_URL: api.url }, version: "1.5.10", deadline: Date.now() + 5000, stored: async () => ending, fetch: fetchFn })
+  assert.deepEqual(data, SUMMARY)
+  assert.ok(api.calls.every(call => call.headers.authorization === "Bearer adc-fresh" && call.headers["user-agent"].endsWith("auth_method=adc)")))
+  assert.equal(ending.token.access_token, STORED.token.access_token)
+})
+
 test("a direct read that fails leaves the region refusal standing: unknown, never zero or full", async t => {
   for (const [answer, stored] of [
     [{ retrieveUserQuotaSummary: [403, { error: { code: 403, message: "secret@example.com" } }] }, STORED],

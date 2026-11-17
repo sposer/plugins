@@ -21,24 +21,17 @@ There are three ways to sign in:
 
 - **Sign in with Google (browser)** is Antigravity's own Google sign-in:
   1. The plugin listens on a port of `127.0.0.1` (and `::1`).
-  2. It opens Google's consent page with PKCE and Antigravity's client and
-     scopes.
+  2. Open the displayed Google consent URL yourself. It uses PKCE and
+     Antigravity's client and scopes.
   3. Google sends the browser back to `/oauth-callback` with a code, which
      the plugin trades for a refresh token.
 - **Import an account** takes a refresh token or exported JSON:
   - one account-manager account (`{"email", "token": {"refresh_token", "project_id"}}`);
   - a list of accounts, or an `{"accounts": […]}` object;
-  - a sub2api account with `platform: "antigravity"`, `type: "oauth"` and
-    `credentials.refresh_token`, or a sub2api data export (`type:
-    "sub2api-data"`, optional `version: 1`, `accounts: […]`);
   - plain lines of refresh tokens, where `#` starts a comment.
 
-  The import signs in the first applicable account, checking its refresh
-  token with Google. sub2api's `credentials.email` and `project_id` are
-  reused; its exported access token and expiry are replaced by the fresh
-  token. Mixed sub2api exports skip other platforms, non-OAuth accounts
-  and accounts without a refresh token. An export with no applicable
-  account is refused; other subscription formats remain unsupported.
+  The import signs in the first account, checking its refresh token with
+  Google. Other subscription formats remain unsupported.
 - **Sign in with Google (paste callback URL or code)** works when magpie
   runs remotely or in Docker, without a local callback listener:
   1. Open the sign-in URL in a browser on your own computer.

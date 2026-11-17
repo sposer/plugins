@@ -5,6 +5,7 @@ import path from "node:path"
 import { agySpawnSpec, childEnv as agyChildEnv } from "./platform.mjs"
 import { modelsInGroup } from "./model-ids.mjs"
 import { cannotSignIn, isDead, noteDead, storedSignIn, storedToken } from "./signin.mjs"
+import { refreshOAuth } from "./oauth.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -387,21 +388,33 @@ export async function readQuotaDirect({
   const ends = Date.parse(token.expiry ?? "")
   if (!access || Number.isFinite(ends) && ends > 0 && ends - now() < 2 * 60 * 1000) {
     if (!text(token.refresh_token)) throw new UsageError("agy's stored sign-in has expired.")
-    const res = await fetchFn(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: token.refresh_token, client_id: CLIENT_ID, client_secret: CLIENT_SECRET }).toString(),
-      signal: timed(),
-    })
-    let fresh
-    try { fresh = JSON.parse(await res.text()) } catch {}
-    access = res.ok ? text(fresh?.access_token) : ""
-    // Google's answer for a refresh token it no longer takes: only a new
-    // sign-in mends it
-    if (!access && (res.status === 400 || res.status === 401) && fresh?.error === "invalid_grant") {
-      throw new UsageError("agy's stored sign-in no longer works.", { kind: "auth" })
+    if (sign.oauth) {
+      try {
+        const fresh = await refreshOAuth(sign.oauth, token.refresh_token, { fetch: fetchFn, signal: timed() })
+        access = fresh.access_token
+      } catch (error) {
+        if ((error.status === 400 || error.status === 401) && error.error === "invalid_grant") {
+          throw new UsageError("agy's stored sign-in no longer works.", { kind: "auth" })
+        }
+        throw new UsageError("agy's stored sign-in couldn't be renewed.")
+      }
+    } else {
+      const res = await fetchFn(TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: token.refresh_token, client_id: CLIENT_ID, client_secret: CLIENT_SECRET }).toString(),
+        signal: timed(),
+      })
+      let fresh
+      try { fresh = JSON.parse(await res.text()) } catch {}
+      access = res.ok ? text(fresh?.access_token) : ""
+      // Google's answer for a refresh token it no longer takes: only a new
+      // sign-in mends it
+      if (!access && (res.status === 400 || res.status === 401) && fresh?.error === "invalid_grant") {
+        throw new UsageError("agy's stored sign-in no longer works.", { kind: "auth" })
+      }
+      if (!access) throw new UsageError("agy's stored sign-in couldn't be renewed.")
     }
-    if (!access) throw new UsageError("agy's stored sign-in couldn't be renewed.")
   }
   const base = (text(env.CLOUD_CODE_URL) || CODE_ASSIST).replace(/\/+$/, "")
   const headers = {

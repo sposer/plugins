@@ -272,42 +272,8 @@ test.each(["authorize", "callback"])("import %s cancellation aborts its single r
   expect(deadlines.size).toBe(0)
 })
 
-const sub2apiAccount = {
-  platform: "antigravity", type: "oauth",
-  credentials: { refresh_token: "sub2api-refresh", access_token: "exported-access", expires_at: "1800000000", email: "imported@example.com", project_id: "exported-project" },
-}
-
-test("a sub2api Antigravity OAuth account rechecks its refresh token and retains its email and project", async () => {
-  const seen = google({ loadCodeAssist: () => new Response("unavailable", { status: 503 }) })
-  const result = await importAccount(sub2apiAccount)
-  expect(result).toMatchObject({ type: "success", access: "signed-access", refresh: "sub2api-refresh|exported-project", accountId: "imported@example.com" })
-  expect(seen.map((s) => s.name)).toEqual(["token", "loadCodeAssist"])
-  expect(new URLSearchParams(seen[0].body).get("refresh_token")).toBe("sub2api-refresh")
-})
-
-test.each([{ type: "sub2api-data", version: 1 }, { type: "sub2api-data" }, {}])("a mixed sub2api export selects the first valid Antigravity OAuth account: %j", async (metadata) => {
-  const seen = google()
-  const result = await importAccount({
-    ...metadata, exported_at: "2026-11-17T00:00:00Z", proxies: [], accounts: [
-      { ...sub2apiAccount, platform: "openai" },
-      { ...sub2apiAccount, type: "apikey" },
-      { ...sub2apiAccount, credentials: { access_token: "no-refresh" } },
-      sub2apiAccount,
-      { ...sub2apiAccount, credentials: { refresh_token: "later-refresh" } },
-    ],
-  })
-  expect(result).toMatchObject({ type: "success", refresh: "sub2api-refresh|exported-project", accountId: "imported@example.com" })
-  expect(new URLSearchParams(seen.find((s) => s.name === "token").body).get("refresh_token")).toBe("sub2api-refresh")
-})
-
 test.each([
-  { ...sub2apiAccount, platform: "openai", refresh_token: "not-antigravity" },
-  { ...sub2apiAccount, type: "apikey", refresh_token: "not-oauth" },
-  { type: "oauth", credentials: sub2apiAccount.credentials },
-  { type: "unknown", credentials: sub2apiAccount.credentials },
   { type: "kiro", refresh_token: "not-antigravity" },
-  { type: "sub2api-data", accounts: [{ ...sub2apiAccount, platform: "gemini" }] },
-  { type: "sub2api-data", version: 2, accounts: [sub2apiAccount] },
   "",
 ])("an inapplicable import fails without contacting Google: %j", async (account) => {
   const seen = google()

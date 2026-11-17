@@ -5,9 +5,10 @@
 // (renew), drops the sign-in (logout) or fails (anything else).
 import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fakeCLI } from "./fake-cli.mjs"
 import { GrokAuthPlugin } from "./index.mjs"
 
 noRealGrok()
@@ -15,32 +16,10 @@ noRealGrok()
 const real = globalThis.fetch
 const env = { ...process.env }
 const root = mkdtempSync(join(tmpdir(), "grok-refresh-"))
-afterAll(() => rmSync(root, { recursive: true, force: true }))
-
-// The fake CLI is /bin/sh under grok's name, not a script written here: on
-// macOS the first run of a file just written waits for the system's scan
-// of it, which took 4-15s on a busy machine and timed these tests out
-// (#65). The plugin runs `grok models` in the folder above the account's
-// home, so that is `sh models` reading the script `models` in root: a
-// plain file, read and never scanned. `grok --version` is sh's own answer
-// (bash's version, or dash refusing the flag); no test here checks the
-// version a request says.
-const bin = join(root, "bin")
 const later = new Date(Date.now() + 24 * 3600_000).toISOString()
-mkdirSync(bin)
-symlinkSync("/bin/sh", join(bin, "grok"))
-writeFileSync(
-  join(root, "models"),
-  `n=$(( $(cat "$GROK_HOME/runs" 2>/dev/null || echo 0) + 1 ))
-echo $n > "$GROK_HOME/runs"
-sleep 0.2
-case "$FAKE_GROK" in
-  renew) printf '{"a":{"key":"tok-%s","email":"g@x.ai","expires_at":"${later}"}}' $n > "$GROK_HOME/auth.json" ;;
-  logout) rm -f "$GROK_HOME/auth.json" ;;
-  *) exit 1 ;;
-esac
-`,
-)
+const cli = fakeCLI(root, later, 200)
+const { bin } = cli
+afterAll(() => { cli.dispose(); rmSync(root, { recursive: true, force: true }) })
 
 let home
 beforeEach(() => {
