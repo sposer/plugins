@@ -42,20 +42,46 @@ translations are refused.
     left out of the CLI's run, so the sign-in lands in that home.
   - When the CLI finishes but leaves no sign-in there, the failure says
     which file it read and what it found.
+  - The plugin waits 30 seconds for a link and up to 10 minutes for the
+    interaction, including its callback. The latter is a local wait limit,
+    not xAI's device-code expiry: the CLI owns that expiry and doesn't
+    expose it with the printed link. Cancel or start again if needed.
+    Cancellation, failure or timeout stops the CLI and removes only a new,
+    unsaved private home. The CLI's existing home is left in place, and a
+    successful account's home is kept, including on repeated callbacks.
 - **Use Grok Build's current sign-in** takes the account the CLI is
   signed in to, with nothing to approve.
-- **Import CPA Grok account JSON** copies one enabled xAI OAuth account from
-  a CLIProxyAPI (CPA) account JSON file (CPA keeps it as
-  `~/.cli-proxy-api/xai-<email>.json`) into a private home for this plugin.
-  CPA and Grok Build rotate the same refresh token, so stop using that
-  account in CPA before importing it. The file is read, never rewritten.
+- **Import CPA / sub2api Grok account JSON** accepts a file path or pasted
+  JSON for one account. CPA's enabled xAI OAuth account files
+  (`~/.cli-proxy-api/xai-<email>.json`) remain supported. sub2api accounts
+  must explicitly name `platform: "grok"` and `type: "oauth"`, with their
+  OAuth fields under `credentials`; `expires_at` is an RFC3339 string,
+  not Unix seconds. An X sign-in can omit email when its user id or token
+  subject identifies the account.
+  - In magpie, **Import accounts from a file…** accepts multiple JSON files
+    or pasted JSON: individual accounts, lists, or sub2api exports with an
+    `accounts` list (`type: "sub2api-data"`, `version: 1`, when present).
+    Other platforms and non-OAuth accounts are skipped; malformed Grok
+    credentials report an error. The single-account method directs exports
+    containing several Grok accounts to this bulk import.
+  - Imports require the Grok Build xAI client
+    (`b1a00492-073a-47ea-816f-4c329264a828`) and its token issuer/audience.
+    sub2api can configure another client id; those accounts can't be
+    imported for this CLI. Grok Build remains responsible for renewal.
+  - Duplicate accounts make one home. Existing private or CLI sign-ins are
+    reused without rewriting them. Cancelling a bulk import removes all
+    homes that batch created before returning its accounts.
+  - Stop using the imported accounts in CPA or sub2api before continuing:
+    both clients rotate the same refresh token, so they must not refresh
+    the account concurrently. Import reads the source without changing its
+    files, disabling accounts or contacting xAI.
 
 ## Where the sign-in is kept
 
 The CLI keeps the sign-in in its home, as `auth.json`. OpenCode (or
 magpie) keeps where that home is, the token and its expiry. Importing a CPA
-account writes only its translated xAI OAuth fields to a private home owned
-by this plugin; the selected CPA file is left unchanged.
+or sub2api account writes only its translated xAI OAuth fields to a private
+home owned by this plugin; source files are left unchanged.
 
 The plugin reads `auth.json`; Grok Build refreshes the token, which changes
 each time. The plugin runs `grok models` in that home, so the CLI renews

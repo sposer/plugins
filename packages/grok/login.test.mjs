@@ -1,183 +1,360 @@
-// A `grok login` that prints no link says why (𝕏 on Discord): the sign-in
-// said only "grok login gave no link to open", where the CLI had said it
-// couldn't reach x.ai.
-//
-// The fake CLI is /bin/sh under grok's name, not a script written here: on
-// macOS the first run of a file just written waits for the system's scan
-// of it, which took 4-15s on a busy machine and timed these tests out
-// (#65). `grok login --device-auth` is then `sh login --device-auth`, and
-// sh reads the script `login` in the folder the plugin runs it in, the
-// home folder: a plain file, read and never scanned.
+// Exercise the native CLI boundary without running Grok Build or writing a
+// login script in the user's home. The child and interaction timers are
+// controlled on Windows as well as POSIX; every filesystem target is temporary.
 import { noRealGrok } from "./nocli.mjs"
-import { afterAll, beforeAll, expect, test } from "bun:test"
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
-import { homedir, tmpdir } from "node:os"
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
+import * as childProcess from "node:child_process"
+import { EventEmitter, getEventListeners } from "node:events"
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { GrokAuthPlugin } from "./index.mjs"
 
 noRealGrok()
 
+const realSpawn = childProcess.spawn
+let spawnLogin
+mock.module("node:child_process", () => ({ ...childProcess, spawn: (...args) => spawnLogin ? spawnLogin(...args) : realSpawn(...args) }))
+const { GrokAuthPlugin } = await import("./index.mjs")
 const dir = mkdtempSync(join(tmpdir(), "grok-login-"))
-const script = join(homedir(), "login")
-beforeAll(() => {
-  // the script goes in the home folder, so only a home made for the test
-  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
-})
-afterAll(() => {
-  rmSync(dir, { recursive: true, force: true })
-  rmSync(script, { force: true })
-})
-
-async function signIn(body) {
-  const bin = mkdtempSync(join(dir, "bin-"))
-  symlinkSync("/bin/sh", join(bin, "grok"))
-  symlinkSync("/bin/sh", join(bin, "grok.exe")) // as a test that says it is Windows looks for it
-  writeFileSync(script, `${body}\n`)
-  const env = { GROK_BIN_DIR: process.env.GROK_BIN_DIR, GROK_HOME: process.env.GROK_HOME }
-  process.env.GROK_BIN_DIR = bin
-  process.env.GROK_HOME = mkdtempSync(join(dir, "home-"))
-  try {
-    const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
-    return await hooks.auth.methods[0].authorize()
-  } finally {
-    for (const [k, v] of Object.entries(env)) v === undefined ? delete process.env[k] : (process.env[k] = v)
-  }
-}
-
-test.skipIf(process.platform === "win32")("a login that fails says what the CLI said", async () => {
-  await expect(signIn(`printf 'Starting sign-in\\n\\033[31merror: request to auth.x.ai timed out\\033[0m\\n' >&2; exit 1`)).rejects.toThrow(
-    "grok login gave no link to open: error: request to auth.x.ai timed out",
-  )
-})
-
-// as grok 1.0.46 says a proxy it can't get through: the URL in it is the
-// endpoint, not a page to open
-test.skipIf(process.platform === "win32")("the endpoint a failed login names is no link", async () => {
-  const said = "Error: error sending request for url (https://auth.x.ai/oauth2/device/code): client error (Connect): tunnel error: failed to create underlying connection: tcp connect error: Connection refused (os error 61)"
-  await expect(signIn(`echo '${said}' >&2; exit 1`)).rejects.toThrow(`grok login gave no link to open: ${said}`)
-})
-
-test.skipIf(process.platform === "win32")("a login that says nothing asks whether x.ai is reachable", async () => {
-  await expect(signIn("exit 1")).rejects.toThrow("can this machine reach auth.x.ai?")
-})
-
-test.skipIf(process.platform === "win32")("a login's link is still handed on", async () => {
-  const a = await signIn(`echo 'To sign in, open this URL in your browser:'; echo '  https://accounts.x.ai/oauth2/device?user_code=AB12-CD34'; exit 1`)
-  expect(a.url).toBe("https://accounts.x.ai/oauth2/device?user_code=AB12-CD34")
-})
-
-// `grok login --device-auth` opens its page itself where it can, and the
-// sign-in's opener opened it too: two pages every time (andyfmyth on X).
-// On macOS and Windows, where nothing turns Grok Build's off, the sign-in
-// says the page is open already; elsewhere Grok Build is given a $BROWSER
-// that opens nothing, and the page is the opener's to open.
-async function signInOn(platform, body) {
-  const was = Object.getOwnPropertyDescriptor(process, "platform")
-  const browser = process.env.BROWSER
-  delete process.env.BROWSER
-  Object.defineProperty(process, "platform", { ...was, value: platform })
-  try {
-    return await signIn(body)
-  } finally {
-    Object.defineProperty(process, "platform", was)
-    if (browser !== undefined) process.env.BROWSER = browser
-  }
-}
-
-// the link carries the $BROWSER Grok Build was given
-const saysBrowser = `echo "https://accounts.x.ai/oauth2/device?user_code=AB12-CD34&browser=$BROWSER"; exit 1`
-
-test.skipIf(process.platform === "win32")("on macOS and Windows the page Grok Build opened isn't opened again", async () => {
-  for (const os of ["darwin", "win32"]) {
-    const a = await signInOn(os, saysBrowser)
-    expect(a.opened).toBe(true)
-    expect(a.url).toBe("https://accounts.x.ai/oauth2/device?user_code=AB12-CD34&browser=")
-  }
-})
-
-test.skipIf(process.platform === "win32")("elsewhere Grok Build opens nothing and the page is the opener's", async () => {
-  for (const os of ["linux", "freebsd"]) {
-    const a = await signInOn(os, saysBrowser)
-    expect(a.opened).toBe(false)
-    expect(a.url).toBe("https://accounts.x.ai/oauth2/device?user_code=AB12-CD34&browser=true")
-  }
-})
-
-// A login that ends signed in is kept, or says where it looked and what it
-// found (llllleo9 on 𝕏: "grok login finished without an account"). Run in a
-// sandbox against a stand-in auth.x.ai, grok 1.0.62 writes "email": null
-// when the sign-in's id_token has no email (an xAI account signed in
-// through X), and keeps its sign-in at GROK_AUTH_PATH when that is set.
+const envKeys = ["HOME", "USERPROFILE", "GROK_HOME", "GROK_BIN_DIR", "XDG_CONFIG_HOME", "GROK_AUTH_PATH", "PATH", "BROWSER"]
+const realEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]))
+const nativeSetTimeout = globalThis.setTimeout
+const nativeClearTimeout = globalThis.clearTimeout
 const LINK = "https://accounts.x.ai/oauth2/device?user_code=AB12-CD34"
-const later = new Date(Date.now() + 24 * 3600_000).toISOString()
 const scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-const jwt = (claims) => ["e30", Buffer.from(JSON.stringify(claims)).toString("base64url"), "sig"].join(".")
+const later = "2099-01-01T00:00:00Z"
 const theirs = { [scope]: { key: "cli-tok", email: "cli@x.ai", user_id: "u-cli", expires_at: later } }
+const account = { [scope]: { key: "tok", email: null, user_id: "u-1", expires_at: later } }
+let cliHome, config, calls, children, timers, setTimer, clearTimer, behavior
 
-// finish runs a login that prints the link, writes what (if anything) where
-// grok 1.0.62 does, says it signed in and exits 0. With cli, the CLI's own
-// home already holds that sign-in, so the plugin signs in beside it.
-async function finish({ what, cli, env = {} }) {
-  const bin = mkdtempSync(join(dir, "bin-"))
-  symlinkSync("/bin/sh", join(bin, "grok"))
-  const write = what ? `printf '%s' '${JSON.stringify(what)}' > "\${GROK_AUTH_PATH:-$GROK_HOME/auth.json}"` : ":"
-  writeFileSync(script, `echo 'To sign in, open this URL in your browser:'\necho '  ${LINK}'\n${write}\necho '✓ Signed in'\n`)
-  const cliHome = mkdtempSync(join(dir, "home-"))
-  if (cli) writeFileSync(join(cliHome, "auth.json"), JSON.stringify(cli))
-  const set = { GROK_BIN_DIR: bin, GROK_HOME: cliHome, XDG_CONFIG_HOME: mkdtempSync(join(dir, "cfg-")), ...env }
-  const was = Object.fromEntries(Object.keys(set).map((k) => [k, process.env[k]]))
-  Object.assign(process.env, set)
-  try {
-    const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
-    const a = await hooks.auth.methods[0].authorize()
-    expect(a.url).toBe(LINK)
-    return { r: await a.callback(), cliHome }
-  } finally {
-    for (const [k, v] of Object.entries(was)) v === undefined ? delete process.env[k] : (process.env[k] = v)
+class Child extends EventEmitter {
+  stdout = new EventEmitter()
+  stderr = new EventEmitter()
+  kills = []
+  output(text, stderr = false) { (stderr ? this.stderr : this.stdout).emit("data", Buffer.from(text)) }
+  close(code = 0) {
+    if (this.exited) return
+    this.exited = true
+    children.delete(this)
+    this.emit("exit", code)
+    this.emit("close", code)
+  }
+  kill(signal) {
+    this.kills.push(signal)
+    // A child may finish a write as it is killed. Cleanup must follow exit.
+    queueMicrotask(() => {
+      writeFileSync(join(this.home, "late-write"), "temporary")
+      this.close(null)
+    })
+    return true
   }
 }
 
-test.skipIf(process.platform === "win32")("a sign-in beside the CLI's own with no email is kept by its user id", async () => {
-  const { r } = await finish({ cli: theirs, what: { [scope]: { key: "tok", email: null, user_id: "u-1", expires_at: later } } })
-  expect(r.type).toBe("success")
+beforeEach(() => {
+  cliHome = mkdtempSync(join(dir, "home-"))
+  config = mkdtempSync(join(dir, "config-"))
+  const user = mkdtempSync(join(dir, "user-"))
+  const bin = mkdtempSync(join(dir, "bin-"))
+  writeFileSync(join(bin, process.platform === "win32" ? "grok.exe" : "grok"), "not an executable; spawn is mocked")
+  Object.assign(process.env, { HOME: user, USERPROFILE: user, GROK_HOME: cliHome, GROK_BIN_DIR: bin, XDG_CONFIG_HOME: config, PATH: "" })
+  calls = []
+  children = new Set()
+  timers = new Map()
+  behavior = () => {}
+  setTimer = spyOn(globalThis, "setTimeout").mockImplementation((fn, ms, ...args) => {
+    if (ms !== 100 && ms !== 30_000 && ms !== 600_000) return nativeSetTimeout(fn, ms, ...args)
+    const timer = { ms, fire: () => { timers.delete(timer); fn(...args) } }
+    timers.set(timer, timer)
+    return timer
+  })
+  clearTimer = spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+    if (!timers.delete(timer)) nativeClearTimeout(timer)
+  })
+  spawnLogin = (exe, args, options) => {
+    const child = new Child()
+    child.home = options.env.GROK_HOME
+    calls.push({ exe, args, options, child })
+    children.add(child)
+    queueMicrotask(() => behavior(child, options))
+    return child
+  }
+})
+
+afterEach(() => {
+  for (const child of children) child.close(1)
+  setTimer.mockRestore()
+  clearTimer.mockRestore()
+  spawnLogin = undefined
+  for (const [k, v] of Object.entries(realEnv)) v === undefined ? delete process.env[k] : (process.env[k] = v)
+})
+afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+const homes = () => existsSync(join(config, "opencode-grok-auth")) ? readdirSync(join(config, "opencode-grok-auth")) : []
+const fire = (ms) => {
+  const timer = [...timers.values()].find((t) => t.ms === ms)
+  expect(timer).toBeDefined()
+  timer.fire()
+}
+const drained = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
+const authorize = async (signal) => (await GrokAuthPlugin({})).auth.methods[0].authorize(undefined, { signal })
+const existing = () => writeFileSync(join(cliHome, "auth.json"), JSON.stringify(theirs))
+function complete(child, what = account) {
+  if (what) writeFileSync(join(child.home, "auth.json"), JSON.stringify(what))
+  child.output("✓ Signed in\n")
+  child.close(0)
+}
+function released(signal) {
+  expect(children.size).toBe(0)
+  expect(timers.size).toBe(0)
+  if (signal) expect(getEventListeners(signal, "abort")).toHaveLength(0)
+  for (const { child } of calls) {
+    expect(child.stdout.listenerCount("data")).toBe(0)
+    expect(child.stderr.listenerCount("data")).toBe(0)
+    expect(child.listenerCount("error")).toBe(0)
+    expect(child.listenerCount("exit")).toBe(0)
+    expect(child.listenerCount("close")).toBe(0)
+  }
+}
+
+test("pre-aborted sign-in allocates no home and starts no CLI", async () => {
+  existing()
+  const c = new AbortController()
+  c.abort()
+  await expect(authorize(c.signal)).rejects.toThrow()
+  expect(calls).toHaveLength(0)
+  expect(homes()).toEqual([])
+  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
+  released(c.signal)
+})
+
+test("cancellation during the initial credential read starts no CLI or new home", async () => {
+  existing()
+  const auth = (await GrokAuthPlugin({})).auth
+  const c = new AbortController()
+  const pending = auth.methods[0].authorize(undefined, { signal: c.signal })
+  c.abort()
+  await expect(pending).rejects.toThrow()
+  expect(calls).toHaveLength(0)
+  expect(homes()).toEqual([])
+  released(c.signal)
+})
+
+test("an asynchronous spawn error releases its home and retains the error", async () => {
+  existing()
+  behavior = (child) => child.emit("error", new Error("CLI unavailable"))
+  await expect(authorize()).rejects.toThrow("CLI unavailable")
+  expect(homes()).toEqual([])
+  released()
+})
+
+test("startup failure releases its new home and preserves the CLI diagnosis", async () => {
+  existing()
+  spawnLogin = () => { throw new Error("spawn denied") }
+  await expect(authorize()).rejects.toThrow("spawn denied")
+  expect(homes()).toEqual([])
+  released()
+})
+
+test("cancelling while waiting for the link reaps the CLI before removing only its new home", async () => {
+  existing()
+  const c = new AbortController()
+  const pending = authorize(c.signal)
+  await drained()
+  expect(homes()).toHaveLength(1)
+  c.abort()
+  await expect(pending).rejects.toThrow()
+  expect(calls[0].child.kills).toEqual(["SIGKILL"])
+  expect(homes()).toEqual([])
+  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
+  released(c.signal)
+})
+
+test("a no-link timeout keeps the last CLI network diagnosis, with bounded output handling", async () => {
+  existing()
+  behavior = (child) => {
+    for (let i = 0; i < 1024; i++) child.output("x".repeat(8192))
+    child.output("\n\u001b[31mError: error sending request for url (https://auth.x.ai/oauth2/device/code): proxy refused\u001b[0m\n", true)
+  }
+  const pending = authorize()
+  await drained()
+  fire(30_000)
+  await expect(pending).rejects.toThrow("Error: error sending request for url (https://auth.x.ai/oauth2/device/code): proxy refused")
+  expect(homes()).toEqual([])
+  released()
+})
+
+test("a silent failed CLI retains the reachability diagnostic and leaves an existing CLI home alone", async () => {
+  behavior = (child) => child.close(1)
+  await expect(authorize()).rejects.toThrow("can this machine reach auth.x.ai?")
+  expect(existsSync(cliHome)).toBe(true)
+  released()
+})
+
+test("a callback can cancel a running device login and retries start cleanly", async () => {
+  existing()
+  behavior = (child) => child.output(`${LINK}\n`)
+  const a = await authorize()
+  const c = new AbortController()
+  const pending = a.callback(undefined, { signal: c.signal })
+  c.abort()
+  expect((await pending).type).toBe("failed")
+  expect(homes()).toEqual([])
+  released(c.signal)
+
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
+  const retry = await authorize()
+  expect((await retry.callback()).type).toBe("success")
+  expect(homes()).toHaveLength(1)
+  released()
+})
+
+test("cancellation reaps the writer without waiting on a browser's inherited pipes", async () => {
+  existing()
+  behavior = (child) => child.output(`${LINK}\n`)
+  const a = await authorize()
+  const child = calls[0].child
+  child.kill = (signal) => {
+    child.kills.push(signal)
+    queueMicrotask(() => { child.exited = true; children.delete(child); child.emit("exit", null, signal) })
+    return true
+  }
+  const c = new AbortController()
+  const pending = a.callback(undefined, { signal: c.signal })
+  c.abort()
+  expect((await pending).type).toBe("failed")
+  expect(homes()).toEqual([])
+  child.emit("close", null)
+  released(c.signal)
+})
+
+test("callback cancellation interrupts torn-file retry timers as well as the device wait", async () => {
+  existing()
+  behavior = (child) => {
+    child.output(`${LINK}\n`)
+    writeFileSync(join(child.home, "auth.json"), "")
+    child.close(0)
+  }
+  const a = await authorize()
+  const c = new AbortController()
+  const pending = a.callback(undefined, { signal: c.signal })
+  await drained()
+  expect([...timers.values()].some((t) => t.ms === 100)).toBe(true)
+  c.abort()
+  expect((await pending).type).toBe("failed")
+  expect(homes()).toEqual([])
+  released(c.signal)
+})
+
+test("an abandoned callback expires and cleans a successful but unsaved new home", async () => {
+  existing()
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
+  const a = await authorize()
+  expect(homes()).toHaveLength(1)
+  fire(600_000)
+  await drained()
+  expect(homes()).toEqual([])
+  expect((await a.callback()).type).toBe("failed")
+  released()
+})
+
+test("the device deadline also stops a running callback, without deleting the CLI home", async () => {
+  behavior = (child) => child.output(`${LINK}\n`)
+  const a = await authorize()
+  const pending = a.callback()
+  fire(600_000)
+  expect((await pending).type).toBe("failed")
+  expect(calls[0].child.kills).toEqual(["SIGKILL"])
+  expect(existsSync(cliHome)).toBe(true)
+  released()
+})
+
+test("authorize cancellation remains active after the link, including before callback", async () => {
+  existing()
+  const c = new AbortController()
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
+  const a = await authorize(c.signal)
+  c.abort()
+  await drained()
+  expect(homes()).toEqual([])
+  expect((await a.callback()).type).toBe("failed")
+  released(c.signal)
+})
+
+test("a successful email-less sign-in is saved once; a repeated or pre-aborted callback cannot delete it", async () => {
+  existing()
+  const c = new AbortController()
+  const away = join(dir, "do-not-write-auth.json")
+  process.env.GROK_AUTH_PATH = away
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
+  const a = await authorize(c.signal)
+  const [r, repeated] = await Promise.all([a.callback(), a.callback()])
+  expect(a.url).toBe(LINK)
+  expect(a.opened).toBe(process.platform === "win32" || process.platform === "darwin")
+  expect(r).toEqual(repeated)
   expect(r.accountId).toBe("u-1")
-  expect(r.access).toBe("tok")
-})
-
-test.skipIf(process.platform === "win32")("with no user id either, it is kept by the token's subject", async () => {
-  const key = jwt({ sub: "u-2", iss: "https://auth.x.ai" })
-  const { r } = await finish({ cli: theirs, what: { [scope]: { key, email: null, user_id: "", expires_at: later } } })
   expect(r.type).toBe("success")
-  expect(r.accountId).toBe("u-2")
+  expect(calls[0].args).toEqual(["login", "--device-auth"])
+  expect(calls[0].options.cwd).toBe(process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME)
+  expect(calls[0].options.env.GROK_AUTH_PATH).toBeUndefined()
+  if (!a.opened) expect(calls[0].options.env.BROWSER).toBe("true")
+  expect(existsSync(away)).toBe(false)
+  c.abort()
+  expect(await a.callback(undefined, { signal: c.signal })).toEqual(r)
+  expect(existsSync(join(r.refresh, "auth.json"))).toBe(true)
+  expect(homes()).toHaveLength(1)
+  expect(JSON.parse(readFileSync(join(cliHome, "auth.json"), "utf8"))).toEqual(theirs)
+  released(c.signal)
 })
 
-test.skipIf(process.platform === "win32")("one that names no account at all says so, and where", async () => {
-  const { r, cliHome } = await finish({ cli: theirs, what: { [scope]: { key: "tok", email: null, expires_at: later } } })
-  expect(r.type).toBe("failed")
-  expect(r.error).toContain('grok login finished (it said "✓ Signed in")')
-  expect(r.error).toContain("names no account")
-  expect(r.error).toContain(cliHome)
+test("a pre-aborted first callback cleans its unsaved new home", async () => {
+  existing()
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child) }
+  const a = await authorize()
+  const c = new AbortController()
+  c.abort()
+  expect((await a.callback(undefined, { signal: c.signal })).type).toBe("failed")
+  expect(homes()).toEqual([])
+  released(c.signal)
 })
 
-test.skipIf(process.platform === "win32")("a login that leaves nothing says where it looked", async () => {
-  const { r, cliHome } = await finish({})
-  expect(r.type).toBe("failed")
-  expect(r.error).toContain(`left no sign-in where this plugin reads it: there is no ${join(cliHome, "auth.json")}`)
-  expect(r.error).toContain("Use Grok Build's current sign-in")
+test("a failed CLI after printing a link cleans its home without waiting for a callback", async () => {
+  existing()
+  behavior = (child) => child.output(`${LINK}\n`)
+  const a = await authorize()
+  calls[0].child.output("device approval denied\n", true)
+  calls[0].child.close(1)
+  await drained()
+  expect(homes()).toEqual([])
+  expect(await a.callback()).toEqual({ type: "failed", error: "device approval denied" })
+  released()
 })
 
-test.skipIf(process.platform === "win32")("one that leaves a file with no token says what it holds", async () => {
-  const { r } = await finish({ what: { [scope]: { email: "g@x.ai" } } })
-  expect(r.type).toBe("failed")
-  expect(r.error).toContain(`has ${scope}, none with a token`)
+test("a token's subject identifies an X sign-in when email and user_id are absent", async () => {
+  existing()
+  const key = `e30.${Buffer.from(JSON.stringify({ sub: "u-sub", iss: "https://auth.x.ai" })).toString("base64url")}.sig`
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { key, email: null, expires_at: later } }) }
+  const a = await authorize()
+  expect((await a.callback()).accountId).toBe("u-sub")
+  released()
 })
 
-// GROK_AUTH_PATH moves the CLI's sign-in out of its home: the login runs
-// without it, so the sign-in lands where the plugin reads it
-test.skipIf(process.platform === "win32")("GROK_AUTH_PATH doesn't take the sign-in elsewhere", async () => {
-  const away = join(mkdtempSync(join(dir, "away-")), "auth.json")
-  const { r, cliHome } = await finish({ what: { [scope]: { key: "tok", email: "g@x.ai", expires_at: later } }, env: { GROK_AUTH_PATH: away } })
-  expect(r.type).toBe("success")
-  expect(r.accountId).toBe("g@x.ai")
-  expect(r.refresh).toBe(cliHome)
+test("a successful CLI that leaves no usable account preserves the existing file diagnostics", async () => {
+  existing()
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { key: "tok", email: null, expires_at: later } }) }
+  let a = await authorize()
+  expect((await a.callback()).error).toContain("names no account")
+  expect(homes()).toEqual([])
+  released()
+
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child, null) }
+  a = await authorize()
+  expect((await a.callback()).error).toContain("left no sign-in where this plugin reads it")
+  expect(homes()).toEqual([])
+  released()
+
+  behavior = (child) => { child.output(`${LINK}\n`); complete(child, { [scope]: { email: "g@x.ai" } }) }
+  a = await authorize()
+  expect((await a.callback()).error).toContain(`has ${scope}, none with a token`)
+  expect(homes()).toEqual([])
+  released()
 })
