@@ -124,17 +124,20 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
 1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in。agy 已经登录时直接完成；
    没登录时插件运行 agy 自己的 Google 登录（`agy acp --login`），Magpie 打开登录页，
    登录后把页面显示的授权码（或整个页面地址）粘贴回 Magpie。Magpie 在服务器或 Docker
-   里也一样。登录的有效期是 15 分钟。Google 凭据始终由 agy 自己保管（系统钥匙串），
-   插件不保存；agy 列出账号的模型（`agy models`）后才算登录成功。账号在 Magpie 里以 agy
-   存的 Google 邮箱命名（只从钥匙串里读这一项）。
+   里也一样。登录的有效期是 15 分钟，取消会结束登录进程，再次登录会替换旧链接。
+   OAuth 交换仍由 agy 完成，凭据保存在本机钥匙串或 agy 的令牌文件里；agy 列出账号的模型
+   （`agy models`）后才算登录成功。账号在 Magpie 里以 agy 存的 Google 邮箱命名。
    要再加一个 Google 账号，点 agy-cli 的 Add another account（或 Sign in），选「添加另一个
    Google 账号」。新账号有自己的 agy 主目录（`~/.local/state/magpie-agy-bridge/accounts/`
    下），它的登录保存在那个目录里的文件中，不动系统钥匙串里原来那个账号。每个账号单独一行，
-   用量分开显示，可以像其他 provider 的账号一样切换和轮换。
+   用量分开显示，可以像其他 provider 的账号一样切换和轮换。登录失败、取消、过期或被新登录
+   替换时，未完成账号的目录会被删除，已有账号不受影响。
    用过已退役的 Antigravity 插件（`antigravity`）的话，Magpie 的 Providers 页顶上会提示把那里的
    账号移过来，点 Move 即可；也可以在 agy-cli 的 Import accounts from a file… 里选那份登录记录
-   或 agy 的令牌文件。它们本就是 Antigravity 自己的 Google 登录，每个账号放进自己的 agy 主目录，
-   由 agy 检查通过后才加入，凭据不会发到别处。
+   或 agy 的令牌文件，也支持 sub2api 的账号导出 JSON：只导入 `platform: "antigravity"`、
+   `type: "oauth"` 且 `credentials` 中有 `refresh_token` 的账号，其他平台和 API key 账号会跳过。
+   每个账号放进自己的 agy 主目录，由 agy 检查通过后才加入；相同令牌只检查一次，已有邮箱不会重复添加。
+   取消整批导入会删除本批尚未保存的账号目录，保留已有账号。
 2. 模型名写成 `agy-cli/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
 3. 在客户端里选用这个模型即可。

@@ -178,22 +178,28 @@ After installing, sign in from Magpie; no terminal needed.
    sign-in (`agy acp --login`): Magpie opens the sign-in page, and you paste the
    code the page shows (or the page's whole address) back into Magpie. This
    works with Magpie on a server or in Docker too. The sign-in waits 15
-   minutes. Google credentials stay with agy (in the system keyring); the
-   plugin never stores them, and counts the sign-in as done only once
+   minutes; cancelling stops the login process, and starting again replaces
+   the old link. agy still performs the OAuth exchange, and credentials stay
+   in the local keyring or agy's token file. The sign-in is done only once
    `agy models` lists the account's models. Magpie names the account by the
-   Google email agy stored (the one thing read from the keyring for it).
+   Google email agy stored.
    To add another Google account, click agy-cli's Add another account (or
    Sign in) and pick "Add another Google account". The new account gets an
    agy home of its own (under `~/.local/state/magpie-agy-bridge/accounts/`),
    and agy keeps its sign-in in a file there, leaving the account in the
    system keyring as it is. Each account has its own row and its own usage,
-   and is switched and rotated like any provider's accounts.
+   and is switched and rotated like any provider's accounts. Failure,
+   cancellation, expiry or a replacement sign-in removes the unfinished
+   account's folder, leaving existing accounts alone.
    Accounts signed in on the retired Antigravity plugin (`antigravity`) move
    over from the line Magpie shows over its Providers list (Move), or from
-   agy-cli's Import accounts from a file…, which takes that plugin's sign-in or
-   agy's own token file. They are Antigravity's own Google sign-ins: each gets
-   an agy home of its own and is added once agy signs in with it, and the
-   credential goes nowhere else.
+   agy-cli's Import accounts from a file…, which takes that plugin's sign-in,
+   agy's token file, or a sub2api account export. A sub2api account must have
+   `platform: "antigravity"`, `type: "oauth"` and a `credentials.refresh_token`;
+   other providers and API key accounts are skipped. Each gets its own agy
+   home and is added once agy checks it. A token is checked once, and an
+   existing email is not added again. Cancelling a batch removes its unsaved
+   account folders, leaving existing accounts alone.
 2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
    for different thinking levels, they are grouped here as variants of one model,
    and each request is mapped back to the matching agy ID.

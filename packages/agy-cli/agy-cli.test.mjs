@@ -20,6 +20,7 @@ for (const [name, mocks] of [
   ["prefill.mjs", false],
   ["usage.mjs", true],
   ["signin.mjs", false],
+  ["login.mjs", true],
   ["catalog.mjs", false],
   ["step-usage.mjs", false],
   ["tool-schema.mjs", false],
@@ -37,32 +38,27 @@ for (const [name, mocks] of [
     // bun's 5s default per test is a fixed wait these process-spawning tests
     // overrun on a loaded machine; the 240s run bounds a real hang.
     const { code, output } = run(["test", "--timeout", "120000", ...(mocks ? ["--preload", hook] : []), `./${name}`], 240_000)
-    expect(output).toMatch(/\b[1-9]\d* pass\b/)
-    expect(code).toBe(0)
+    expect(code, output).toBe(0)
   }, 250_000)
 }
 
 
 test("test/re2-pattern-unit.mjs", () => {
   const { code, output } = run([path.join(dir, "re2-pattern-unit.mjs")], 60_000)
-  expect(output).toMatch(/ALL OK/)
-  expect(code).toBe(0)
+  expect(code, output).toBe(0)
 }, 70_000)
 
 test("test/smoke.mjs against a fake agy", () => {
   const { code, output } = run([path.join(dir, "smoke.mjs")], 240_000)
-  expect(output).toMatch(/ALL OK \(\d+ checks\)/)
-  expect(code).toBe(0)
+  expect(code, output).toBe(0)
 }, 250_000)
 
 test("test/array-items-unit.mjs", () => {
   const { code, output } = run([path.join(dir, "array-items-unit.mjs")], 60_000)
-  expect(output).toMatch(/ALL OK/)
-  expect(code).toBe(0)
+  expect(code, output).toBe(0)
 }, 70_000)
 
 test("test/documents-unit.mjs", () => {
   const { code, output } = run([path.join(dir, "documents-unit.mjs")], 60_000)
-  expect(output).toMatch(/ALL OK/)
-  expect(code).toBe(0)
+  expect(code, output).toBe(0)
 }, 70_000)

@@ -1,4 +1,4 @@
-import { agyCandidates, childEnv, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
+import { agyCandidates, childEnv, spawnAgy, stopAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
 import { spawn, spawnSync } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -377,10 +377,12 @@ export async function geminiDirArgs(agyPath, env = process.env) {
 
 function execOnce(file, args, opts = {}) {
   return new Promise((resolve) => {
+    const { signal, unrefTimer, ...spawnOpts } = opts
+    const cancelled = () => ({ err: new DOMException("the sign-in was cancelled", "AbortError"), stdout: "", stderr: "", code: null, timedOut: false })
+    if (signal?.aborted) return resolve(cancelled())
     let child
     try {
       const launch = file === "taskkill" ? spawn : spawnAgy
-      const { unrefTimer: _unrefTimer, ...spawnOpts } = opts
       child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
         ...spawnOpts,
@@ -395,27 +397,39 @@ function execOnce(file, args, opts = {}) {
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
-      try { child.kill("SIGKILL") } catch {}
+      signal?.removeEventListener("abort", onAbort)
+      stopAgy(child)
       // A grandchild can hold the pipes open after the kill; never wait for close.
       resolve({ err: null, stdout, stderr, code: null, timedOut })
     }, opts.timeoutMs ?? 30_000)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      stopAgy(child)
+      resolve(cancelled())
+    }
     // Background work (the model catalog refresh) must never hold Node's exit.
     // A caller that awaits the result keeps the deadline referenced.
-    if (opts.unrefTimer) timer.unref?.()
+    if (unrefTimer) timer.unref?.()
     try {
       child.stdout.on("data", (data) => { stdout += data })
       child.stderr.on("data", (data) => { stderr += data })
       child.on("error", (err) => {
         clearTimeout(timer)
+        signal?.removeEventListener("abort", onAbort)
         resolve({ err, stdout, stderr, code: null, timedOut })
       })
       child.on("close", (code) => {
         clearTimeout(timer)
+        signal?.removeEventListener("abort", onAbort)
         resolve({ err: null, stdout, stderr, code, timedOut })
       })
+      signal?.addEventListener("abort", onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     } catch (err) {
       clearTimeout(timer)
-      try { child.kill("SIGKILL") } catch {}
+      signal?.removeEventListener("abort", onAbort)
+      stopAgy(child)
       resolve({ err, stdout, stderr, code: null, timedOut })
     }
   })
@@ -486,13 +500,17 @@ function parseAgyModels(stdout) {
 // take seconds on a real agy, and the host lists models right after.
 const OFFERED_SIGNIN_WAIT_MS = 3_000
 
-async function probeSignedIn(agy) {
+async function probeSignedIn(agy, { signal } = {}) {
+  const cancelled = () => ({ ok: false, why: "the sign-in was cancelled" })
+  if (signal?.aborted) return cancelled()
   // no sign-in stored, or one agy failed with: `agy models` would start
   // agy's own Google sign-in (on Windows, a browser no shim stops), so the
   // caller goes on to magpie's own sign-in link instead
   const blocked = await backgroundBlocked({ fresh: true })
+  if (signal?.aborted) return cancelled()
   if (blocked) return { ok: false, why: blocked }
-  const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: 15_000 })
+  const probe = await execOnce(agy, await modelsArgs(agy), { timeoutMs: 15_000, signal })
+  if (signal?.aborted) return cancelled()
   const listed = !probe.err && !probe.timedOut && probe.code === 0 &&
     probe.stdout.split("\n").some(line => /^\S+\s+\S/.test(line.trim()))
   if (listed) {
@@ -501,9 +519,9 @@ async function probeSignedIn(agy) {
       useAgyPath(agy)
       storeListedCatalog(agy, list, Date.now())
       ms().wantOfferedProbe = true
-      await briefly(probeOfferedOnce(agy), OFFERED_SIGNIN_WAIT_MS)
+      await briefly(probeOfferedOnce(agy, { signal }), OFFERED_SIGNIN_WAIT_MS)
     }
-    return { ok: true }
+    return signal?.aborted ? cancelled() : { ok: true }
   }
   // Google turned the account away (#3501): signing in again took, and
   // Google still refuses it; say so, not agy's last line alone
@@ -635,7 +653,7 @@ function killQuietly(child) {
   }
 }
 
-async function probeOfferedModels(agyPath) {
+async function probeOfferedModels(agyPath, { signal } = {}) {
   const state = ms()
   const home = currentHome()
   const gen = state.offeredGen
@@ -643,8 +661,11 @@ async function probeOfferedModels(agyPath) {
   let child = null
   let conn = null
   let timer
+  const abort = () => conn?.close(new Error("the sign-in was cancelled"))
   try {
+    signal?.throwIfAborted()
     workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-models-"))
+    signal?.throwIfAborted()
     child = spawnAgy(agyPath, ["acp"], { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
     child.on("error", () => conn?.close(new Error("agy acp failed to start")))
     child.on("close", () => conn?.close(new Error("agy acp exited")))
@@ -655,6 +676,8 @@ async function probeOfferedModels(agyPath) {
       onRequest: async (method) => { throw Object.assign(new Error(`not served: ${method}`), { code: -32601 }) },
       onProtocolError: (error) => conn.close(error),
     })
+    signal?.addEventListener("abort", abort, { once: true })
+    signal?.throwIfAborted()
     const deadline = new Promise((_resolve, reject) => {
       timer = setTimeout(() => reject(new Error("agy acp model probe timed out")), OFFERED_PROBE_TIMEOUT_MS)
       timer.unref?.()
@@ -677,18 +700,25 @@ async function probeOfferedModels(agyPath) {
     // Unknown: keep serving Gemini only, and try again later.
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener("abort", abort)
     conn?.close(new Error("probe done"))
-    if (child) killQuietly(child)
-    if (workspace) fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+    if (child) {
+      if (signal?.aborted) stopAgy(child)
+      else killQuietly(child)
+    }
+    if (workspace) {
+      const removing = fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+      if (signal?.aborted) await removing
+    }
   }
 }
 
-function probeOfferedOnce(agyPath) {
+function probeOfferedOnce(agyPath, options) {
   if (ms().acpOfferedModels || ms().offeredProbePromise) return ms().offeredProbePromise
   const now = Date.now()
   if (ms().offeredProbeAt !== null && now - ms().offeredProbeAt < OFFERED_PROBE_RETRY_MS) return null
   ms().offeredProbeAt = now
-  const probe = probeOfferedModels(agyPath).finally(() => {
+  const probe = probeOfferedModels(agyPath, options).finally(() => {
     if (ms().offeredProbePromise === probe) ms().offeredProbePromise = null
   })
   ms().offeredProbePromise = probe
@@ -6627,31 +6657,43 @@ async function signedInAs(homeId = "") {
 // googleSignIn runs agy's own Google sign-in: its link, then the code the
 // page shows. account ({ id, home }) is a new account's own home: agy
 // signs in there, and the home goes again when the sign-in fails.
-async function googleSignIn(agy, account = null) {
+// decision: keep OAuth exchange in agy; not copy sub2api's Google token
+// exchange because agy owns the CLI's sign-in and credential format.
+async function googleSignIn(agy, account = null, { signal } = {}) {
   const home = account?.home ?? null
+  const cleanup = () => { if (account) dropHome(home) }
   const fail = (error) => {
-    if (account) dropHome(home)
+    cleanup()
     return { type: "failed", error }
   }
-  const login = await inAccount(home, () => startLogin(agy))
+  const login = await inAccount(home, () => startLogin(agy, { signal, onFailure: cleanup }))
   if (login.error) return fail(login.error)
+  let submitted = false
   return {
     url: login.url,
-    instructions: "",
+    instructions: "Sign in with Google in the browser, then paste the authorization code or the full URL of the page you land on here. This also works over SSH and in Docker. The link expires after 15 minutes; starting another sign-in replaces it.",
     method: "code",
-    callback: (code, opts = {}) => inAccount(home, async () => {
-      const done = await login.finish(code, { signal: opts.signal })
-      if (done.error) return fail(done.error)
-      // agy stored a new sign-in: read it again, and let what
-      // failed with the old one run again
-      forgetStoredSignIn({ dead: true })
-      // A new account: what agy offered the last one, or refused
-      // before the sign-in, is asked again.
-      forgetOffered()
-      const probe = await probeSignedIn(agy)
-      if (!probe.ok) return fail(`agy signed in, but ${probe.why}`)
-      return signedInAs(account?.id ?? "")
-    }),
+    callback: async (code, opts = {}) => {
+      if (submitted) return { type: "failed", error: "this sign-in has already checked a code; start it again" }
+      submitted = true
+      return inAccount(home, async () => {
+        const signals = [signal, opts.signal].filter(Boolean)
+        const activeSignal = signals.length ? AbortSignal.any(signals) : undefined
+        try {
+          const done = await login.finish(code, { signal: activeSignal })
+          if (done.error) return fail(done.error)
+          // agy stored a new sign-in: reread it and rediscover this account's models.
+          forgetStoredSignIn({ dead: true })
+          forgetOffered()
+          const probe = await probeSignedIn(agy, { signal: activeSignal })
+          if (!probe.ok) return fail(`agy signed in, but ${probe.why}`)
+          const result = await signedInAs(account?.id ?? "")
+          return activeSignal?.aborted ? fail("the sign-in was cancelled") : result
+        } catch (error) {
+          return fail(error.message)
+        }
+      })
+    },
   }
 }
 
@@ -6673,44 +6715,61 @@ async function homeOfEmail(email) {
 // one an account home of its own, whose token file is the sign-in, kept
 // once agy lists the account's models with it. An account signed in here
 // already is left as it is and named again, so it isn't added twice.
-async function importSignIns(texts) {
+async function importSignIns(texts, { signal } = {}) {
+  const cancelled = () => ({ type: "failed", error: "the import was cancelled" })
+  if (signal?.aborted) return cancelled()
   const accounts = importedAccounts(texts)
-  if (!accounts.length) return { type: "failed", error: "no Antigravity sign-in in it: take the retired Antigravity plugin's sign-in or agy's token file" }
+  if (!accounts.length) return { type: "failed", error: "no Antigravity sign-in was found in the imported data" }
   const agy = findAgy()
   if (!agy) return noAgy()
   const out = []
-  for (const a of accounts) {
-    const failed = (error) => ({ type: "failed", error, ...(a.email ? { accountId: a.email } : {}) })
-    if (a.email) {
-      const had = await homeOfEmail(a.email)
-      if (had !== null) {
-        out.push(await inAccount(homeOf(had), () => signedInAs(had)))
+  const created = []
+  try {
+    for (const a of accounts) {
+      if (signal?.aborted) return cancelled()
+      const failed = (error) => ({ type: "failed", error, ...(a.email ? { accountId: a.email } : {}) })
+      if (a.email) {
+        const had = await homeOfEmail(a.email)
+        if (signal?.aborted) return cancelled()
+        if (had !== null) {
+          out.push(await inAccount(homeOf(had), () => signedInAs(had)))
+          continue
+        }
+      }
+      let account
+      try {
+        account = newHome()
+        created.push(account.home)
+        const file = tokenFile(account.home)
+        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+        fs.writeFileSync(file, tokenFileText(a), { mode: 0o600 })
+      } catch (error) {
+        if (account) dropHome(account.home)
+        out.push(failed(`couldn't make a folder for the account: ${error.message}`))
         continue
       }
+      out.push(await inAccount(account.home, async () => {
+        try {
+          forgetStoredSignIn()
+          forgetOffered()
+          const probe = await probeSignedIn(agy, { signal })
+          if (!probe.ok) {
+            dropHome(account.home)
+            return failed(`agy couldn't sign in with it: ${probe.why}`)
+          }
+          return await signedInAs(account.id)
+        } catch (error) {
+          dropHome(account.home)
+          return failed(`agy couldn't sign in with it: ${error.message}`)
+        }
+      }))
     }
-    let account
-    try {
-      account = newHome()
-      const file = tokenFile(account.home)
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-      fs.writeFileSync(file, tokenFileText(a), { mode: 0o600 })
-    } catch (error) {
-      if (account) dropHome(account.home)
-      out.push(failed(`couldn't make a folder for the account: ${error.message}`))
-      continue
-    }
-    out.push(await inAccount(account.home, async () => {
-      forgetStoredSignIn()
-      forgetOffered()
-      const probe = await probeSignedIn(agy)
-      if (!probe.ok) {
-        dropHome(account.home)
-        return failed(`agy couldn't sign in with it: ${probe.why}`)
-      }
-      return signedInAs(account.id)
-    }))
+    return signal?.aborted ? cancelled() : out
+  } finally {
+    // Magpie saves a batch only after import returns. On cancellation none
+    // of this batch's new homes has a saved account, including earlier successes.
+    if (signal?.aborted) for (const home of created) dropHome(home)
   }
-  return out
 }
 
 // homeOfAuth is the home of the account a saved sign-in is, null for
@@ -6754,7 +6813,7 @@ export const AntigravityBridgePlugin = async () => {
       // retired Antigravity plugin's sign-ins, which magpie's Move hands over
       importFrom: IMPORT_FROM.en,
       importFroms: IMPORT_FROM.froms,
-      import: (texts) => importSignIns(Array.isArray(texts) ? texts : [texts]),
+      import: (texts, options) => importSignIns(Array.isArray(texts) ? texts : [texts], options),
       methods: [
         {
           // agy's own Google sign-in (`agy acp --login`): magpie opens its
@@ -6765,13 +6824,14 @@ export const AntigravityBridgePlugin = async () => {
           type: "oauth",
           label: "Sign in with Google",
           labels: { zh: "使用 Google 登录", "zh-TW": "使用 Google 登入", ja: "Google でサインイン" },
-          authorize: async () => {
+          authorize: async (_inputs, { signal } = {}) => {
+            if (signal?.aborted) return { type: "failed", error: "the sign-in was cancelled" }
             const agy = findAgy()
             if (!agy) return noAgy()
-            if ((await probeSignedIn(agy)).ok) {
+            if ((await probeSignedIn(agy, { signal })).ok) {
               return { url: "", instructions: "", method: "auto", callback: async () => signedInAs() }
             }
-            return googleSignIn(agy)
+            return googleSignIn(agy, null, { signal })
           },
         },
         {
@@ -6783,7 +6843,8 @@ export const AntigravityBridgePlugin = async () => {
           type: "oauth",
           label: "Add another Google account",
           labels: { zh: "添加另一个 Google 账号", "zh-TW": "新增另一個 Google 帳號", ja: "別の Google アカウントを追加" },
-          authorize: async () => {
+          authorize: async (_inputs, { signal } = {}) => {
+            if (signal?.aborted) return { type: "failed", error: "the sign-in was cancelled" }
             const agy = findAgy()
             if (!agy) return noAgy()
             let account
@@ -6792,7 +6853,7 @@ export const AntigravityBridgePlugin = async () => {
             } catch (error) {
               return { type: "failed", error: `couldn't make a folder for the account: ${error.message}` }
             }
-            return googleSignIn(agy, account)
+            return googleSignIn(agy, account, { signal })
           },
         },
       ],

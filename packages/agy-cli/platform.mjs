@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import path from "node:path"
 import { accountEnv, currentHome } from "./account.mjs"
 
@@ -113,6 +113,17 @@ export function spawnAgy(file, args, options = {}) {
   const command = agySpawnSpec(file, args)
   const env = childEnv(process.env, options?.env)
   return spawn(command.file, command.args, { ...options, ...command.options, windowsHide: true, env })
+}
+
+// decision: end the Windows process tree before releasing an account home;
+// not kill only the launcher because a .cmd child's agy could keep writing it.
+export function stopAgy(child) {
+  try { child.stdin?.end() } catch {}
+  const kill = process.platform === "win32" ? windowsTreeKill([child.pid]) : null
+  if (kill) {
+    try { spawnSync(kill.file, kill.args, { stdio: "ignore", windowsHide: true, timeout: 3_000 }) } catch {}
+  }
+  try { child.kill("SIGKILL") } catch {}
 }
 
 export function windowsMcpShim(executable, server) {
