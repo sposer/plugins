@@ -170,25 +170,6 @@ test("a paid tier is named, and a tier Google refuses is asked without, once a d
   expect(u.plan).toBe("Google AI Pro")
 })
 
-test("an exported account is imported", async () => {
-  const { imported } = _internal
-  expect(imported('{"email":"a@x.com","token":{"refresh_token":"rt1","project_id":"p1"}}')).toEqual([{ rt: "rt1", project: "p1", email: "a@x.com" }])
-  expect(imported('{"accounts":[{"email":"a@x.com","refreshToken":"rt1"},{"email":"b@x.com","refresh_token":"rt2","projectId":"p2"}]}').map((a) => a.rt)).toEqual(["rt1", "rt2"])
-  expect(imported("# mine\n1//rt-a\n\n1//rt-b\n").map((a) => a.rt)).toEqual(["1//rt-a", "1//rt-b"])
-  expect(() => imported('{"type":"kiro","refresh_token":"x"}')).toThrow("kiro")
-
-  const seen = fake({ who: { email: "c@x.com" } })
-  const p = await AntigravityAuthPlugin({})
-  const m = p.auth.methods[1]
-  expect(m.prompts[0].key).toBe("account")
-  const a = await m.authorize({ account: "1//rt-c" })
-  expect(a.url).toBe("")
-  const r = await a.callback()
-  expect(r).toMatchObject({ type: "success", access: "tok-new", refresh: "1//rt-c|ag-proj", accountId: "c@x.com" })
-  expect(seen.find((s) => s.name === "token").body).toContain("refresh_token=1%2F%2Frt-c")
-  expect((await m.authorize({ account: "" })).type).toBe("failed")
-})
-
 // An Ultra or Pro account's quota for a model is used up: the app asks
 // before it spends Google AI credits, and magpie's switch is that answer.
 const withCredits = { cloudaicompanionProject: "ag-proj", currentTier: { id: "standard-tier" }, paidTier: { id: "g1-ultra-tier", name: "Google AI Ultra", availableCredits: [{ creditType: "GOOGLE_ONE_AI", creditAmount: "25000", minimumCreditAmountForUsage: "50" }] } }

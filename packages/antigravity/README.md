@@ -17,7 +17,7 @@ magpie's built-in Antigravity account.
 
 ## Sign-in
 
-There are two ways to sign in:
+There are three ways to sign in:
 
 - **Sign in with Google (browser)** is Antigravity's own Google sign-in:
   1. The plugin listens on a port of `127.0.0.1` (and `::1`).
@@ -25,14 +25,34 @@ There are two ways to sign in:
      scopes.
   3. Google sends the browser back to `/oauth-callback` with a code, which
      the plugin trades for a refresh token.
-- **Import an account** takes either a refresh token or the JSON an
-  account manager exports:
-  - one account (`{"email", "token": {"refresh_token", "project_id"}}`);
+- **Import an account** takes a refresh token or exported JSON:
+  - one account-manager account (`{"email", "token": {"refresh_token", "project_id"}}`);
   - a list of accounts, or an `{"accounts": […]}` object;
+  - a sub2api account with `platform: "antigravity"`, `type: "oauth"` and
+    `credentials.refresh_token`, or a sub2api data export (`type:
+    "sub2api-data"`, optional `version: 1`, `accounts: […]`);
   - plain lines of refresh tokens, where `#` starts a comment.
 
-  The import signs in the first account it finds. An export of another
-  subscription (a `type` other than Antigravity) is refused.
+  The import signs in the first applicable account, checking its refresh
+  token with Google. sub2api's `credentials.email` and `project_id` are
+  reused; its exported access token and expiry are replaced by the fresh
+  token. Mixed sub2api exports skip other platforms, non-OAuth accounts
+  and accounts without a refresh token. An export with no applicable
+  account is refused; other subscription formats remain unsupported.
+- **Sign in with Google (paste callback URL or code)** works when magpie
+  runs remotely or in Docker, without a local callback listener:
+  1. Open the sign-in URL in a browser on your own computer.
+  2. After consenting, copy the full `http://localhost:8085/oauth-callback?…`
+     address from the browser, even if that page cannot load, and paste it
+     into magpie. The authorization code alone also works.
+
+  A full callback URL is checked against this sign-in's state and redirect;
+  a raw code has no state to check. Both use the same PKCE token exchange
+  as browser sign-in.
+
+Browser sign-in remains the default. Both Google sign-in methods expire
+10 minutes after starting, even if completion is never requested.
+Cancelling sign-in closes its listener and cancels any token exchange.
 
 The sign-in is kept as an `oauth` entry:
 - `refresh` is `<refresh token>|<project>`.

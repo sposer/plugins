@@ -24,6 +24,7 @@
 
 import crypto from "node:crypto"
 import http from "node:http"
+import { setTimeout as delay } from "node:timers/promises"
 
 const PROVIDER = "antigravity"
 
@@ -194,12 +195,14 @@ const tokens = new Map() // refresh token → {access, expires}
 const projects = new Map() // refresh token → project
 const refused = new Map() // refresh token, project, tier → when Google refused the tier
 
-async function postForm(url, form) {
+async function postForm(url, form, signal) {
+  signal?.throwIfAborted()
+  const timeout = AbortSignal.timeout(30_000)
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(form).toString(),
-    signal: AbortSignal.timeout(30_000),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   })
   const text = await res.text()
   if (!res.ok) throw new StatusError(res.status, apiError(text, res.status))
@@ -208,13 +211,14 @@ async function postForm(url, form) {
 
 // token is an access token for s, minted again from its refresh token
 // when less than two minutes of the last are left
-async function token(s) {
+async function token(s, signal) {
+  signal?.throwIfAborted()
   let t = tokens.get(s.rt)
   if (!t && s.access) t = { access: s.access, expires: s.expires }
   if (t?.access && t.expires - Date.now() > 2 * 60 * 1000) return t.access
   let fresh
   try {
-    fresh = await postForm(TOKEN_URL, { grant_type: "refresh_token", refresh_token: s.rt, client_id: CLIENT_ID, client_secret: CLIENT_SECRET })
+    fresh = await postForm(TOKEN_URL, { grant_type: "refresh_token", refresh_token: s.rt, client_id: CLIENT_ID, client_secret: CLIENT_SECRET }, signal)
   } catch (e) {
     // Google refusing the refresh token (invalid_grant) is a sign-in that
     // is over; anything else (the network) may pass
@@ -229,7 +233,7 @@ async function token(s) {
 
 // call is one of Code Assist's methods, its reply's JSON
 async function call(s, base, method, body, headers = {}, signal) {
-  const tok = await token(s)
+  const tok = await token(s, signal)
   const res = await fetch(`${base}/v1internal:${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok, "User-Agent": await userAgent(), ...headers },
@@ -281,11 +285,11 @@ function defaultTier(load) {
   return allowed.find((t) => t?.isDefault) ?? allowed[0] ?? { id: "legacy-tier" }
 }
 
-async function onboard(s, req, headers) {
+async function onboard(s, req, headers, signal) {
   for (let i = 0; i < 5; i++) {
-    const lro = await call(s, DAILY, "onboardUser", req, headers)
+    const lro = await call(s, DAILY, "onboardUser", req, headers, signal)
     if (lro.done) return companion(lro.response?.cloudaicompanionProject)
-    await sleep(_internal.onboardPoll)
+    await delay(_internal.onboardPoll, undefined, { signal })
   }
   throw new Error("Antigravity: setting the account up for Code Assist is taking long; try again in a minute")
 }
@@ -294,13 +298,14 @@ const LOAD_BODY = { metadata: { ideType: "ANTIGRAVITY" } }
 
 // resolveProject finds the project the account is served under, setting
 // the account up when Code Assist has none for it
-async function resolveProject(s) {
+async function resolveProject(s, signal) {
   let load, err
   try {
-    load = await call(s, PROD, "loadCodeAssist", LOAD_BODY)
+    load = await call(s, PROD, "loadCodeAssist", LOAD_BODY, {}, signal)
   } catch (e) {
     err = e
   }
+  signal?.throwIfAborted()
   if (err instanceof SignedOut) throw err
   const { tier, paid, credits } = tiersOf(load)
   if (s.project) {
@@ -314,7 +319,7 @@ async function resolveProject(s) {
   if (!t.id || t.id === "legacy-tier") t.id = "free-tier"
   // as the app's language server asks it: camelCase, the IDE type only,
   // and no headers of its own
-  const id = await onboard(s, { tierId: t.id, metadata: { ideType: "ANTIGRAVITY" } })
+  const id = await onboard(s, { tierId: t.id, metadata: { ideType: "ANTIGRAVITY" } }, undefined, signal)
   if (!id) {
     const why = (load.ineligibleTiers ?? []).find((x) => x?.reasonMessage)?.reasonMessage
     throw new Error(why ? "Antigravity won't serve this Google account: " + why : "Antigravity hasn't set this Google account up (it gave no project); sign in to the Antigravity app with it once, then try again")
@@ -1937,12 +1942,13 @@ const b64url = (b) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_
 
 // signedIn is a refresh token (and a project, when one is known) as the
 // sign-in to keep: the account's email, its project found or set up
-async function signedIn(rt, access, expires, projectID, email) {
+async function signedIn(rt, access, expires, projectID, email, signal) {
   const s = { rt, project: projectID ?? "", access: access ?? "", expires: expires ?? 0, who: email ?? "" }
-  if (!access) await token(s)
-  const tok = await token(s)
+  if (!access) await token(s, signal)
+  const tok = await token(s, signal)
   if (!email) {
-    const res = await fetch(WHO_URL, { headers: { Authorization: "Bearer " + tok }, signal: AbortSignal.timeout(30_000) })
+    const timeout = AbortSignal.timeout(30_000)
+    const res = await fetch(WHO_URL, { headers: { Authorization: "Bearer " + tok }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
     const who = res.ok ? parse(await res.text()) : undefined
     email = who?.email
     if (!email) throw new Error("Google didn't say whose account this is")
@@ -1950,29 +1956,20 @@ async function signedIn(rt, access, expires, projectID, email) {
   // the project, found now so requests don't wait on it; a sign-in is kept
   // without one, found again on the first request
   try {
-    const p = await resolveProject(s)
+    const p = await resolveProject(s, signal)
     s.project = p.id
     projects.set(rt, p)
   } catch (e) {
     if (e instanceof SignedOut) throw e
   }
+  signal?.throwIfAborted()
   const t = tokens.get(rt)
   return { type: "success", access: t?.access ?? tok, refresh: `${rt}|${s.project}`, expires: t?.expires ?? Date.now() + 3600_000, accountId: email }
 }
 
 async function listen(handler) {
   const server = http.createServer(handler)
-  await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", resolve)
-  })
-  const port = server.address().port
-  // localhost may be ::1 to the browser
   const six = http.createServer(handler)
-  await new Promise((resolve) => {
-    six.once("error", () => resolve())
-    six.listen(port, "::1", resolve)
-  })
   const close = () => {
     for (const x of [server, six]) {
       try {
@@ -1981,80 +1978,178 @@ async function listen(handler) {
       } catch {}
     }
   }
-  return { port, close }
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(0, "127.0.0.1", resolve)
+    })
+    const port = server.address().port
+    // localhost may be ::1 to the browser
+    await new Promise((resolve) => {
+      six.once("error", () => resolve())
+      six.listen(port, "::1", resolve)
+    })
+    return { port, close }
+  } catch (e) {
+    close()
+    throw e
+  }
 }
 
 const PAGE = (ok, msg) =>
   `<!doctype html><meta charset="utf-8"><title>Antigravity</title><body style="font:15px system-ui;padding:3em;text-align:center">${ok ? "Signed in to Antigravity. You can close this tab." : "Sign-in failed: " + msg.replace(/[<>&]/g, "")}</body>`
 
-async function signIn() {
-  const verifier = b64url(crypto.randomBytes(32))
-  const challenge = b64url(crypto.createHash("sha256").update(verifier).digest())
-  const state = b64url(crypto.randomBytes(16))
-  let got
-  const back = new Promise((r) => (got = r))
-  const { port, close } = await listen((req, res) => {
-    const u = new URL(req.url ?? "/", "http://localhost")
-    if (u.pathname !== "/oauth-callback") {
-      res.writeHead(404).end()
-      return
+// decision: one attempt owns browser and pasted-code sign-in, PKCE and cleanup;
+// not a second token-exchange flow because the host supports a code callback.
+class SignInAttempt {
+  constructor(manual, signal) {
+    this.manual = manual
+    this.verifier = b64url(crypto.randomBytes(32))
+    this.state = b64url(crypto.randomBytes(16))
+    this.controller = new AbortController()
+    this.signals = new Map()
+    this.back = new Promise((r) => (this.got = r))
+    this.aborted = () => { this.got(); this.close() }
+    this.controller.signal.addEventListener("abort", this.aborted, { once: true })
+    this.timer = setTimeout(() => this.controller.abort(new Error("the sign-in timed out")), SIGN_IN_TIMEOUT)
+    this.timer.unref?.()
+    this.watch(signal)
+  }
+
+  watch(signal) {
+    if (!signal || this.controller.signal.aborted || this.signals.has(signal)) return
+    if (signal.aborted) { this.controller.abort(signal.reason); return }
+    const abort = () => this.controller.abort(signal.reason)
+    this.signals.set(signal, abort)
+    signal.addEventListener("abort", abort, { once: true })
+  }
+
+  close() {
+    clearTimeout(this.timer)
+    this.listener?.close()
+    this.listener = undefined
+    for (const [signal, abort] of this.signals) signal.removeEventListener("abort", abort)
+    this.signals.clear()
+    this.controller.signal.removeEventListener("abort", this.aborted)
+  }
+
+  reply(url) {
+    const redirect = new URL(this.redirect)
+    if (url.origin !== redirect.origin || url.pathname !== redirect.pathname || url.searchParams.get("state") !== this.state) throw new Error("this isn't the sign-in magpie started")
+    const err = url.searchParams.get("error")
+    if (err) return { err: [err, url.searchParams.get("error_description")].filter(Boolean).join(": ") }
+    const code = url.searchParams.get("code")
+    if (!code) throw new Error("Google sent back no authorization code")
+    return { code }
+  }
+
+  async authorize() {
+    if (!this.manual) {
+      this.listener = await listen((req, res) => {
+        const url = new URL(req.url ?? "/", this.redirect)
+        if (url.pathname !== "/oauth-callback") { res.writeHead(404).end(); return }
+        try {
+          const cb = this.reply(url)
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(PAGE(!cb.err, cb.err ?? ""))
+          this.got(cb)
+        } catch (e) {
+          res.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end(PAGE(false, e.message))
+        }
+      })
     }
-    const err = u.searchParams.get("error")
-    const code = u.searchParams.get("code")
-    if (u.searchParams.get("state") !== state || (!code && !err)) {
-      res.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end(PAGE(false, "this page isn't the sign-in magpie started"))
-      return
+    const signal = this.controller.signal
+    if (signal.aborted) { this.close(); signal.throwIfAborted() }
+    // A manual attempt uses the same installed-app loopback redirect, but
+    // never binds a port: the user copies the browser's final address.
+    this.redirect = `http://localhost:${this.listener?.port ?? 8085}/oauth-callback`
+    const q = new URLSearchParams({
+      client_id: CLIENT_ID,
+      redirect_uri: this.redirect,
+      response_type: "code",
+      scope: SCOPES.join(" "),
+      access_type: "offline",
+      prompt: "consent",
+      state: this.state,
+      code_challenge: b64url(crypto.createHash("sha256").update(this.verifier).digest()),
+      code_challenge_method: "S256",
+    })
+    return {
+      url: `${AUTH_URL}?${q}`,
+      instructions: this.manual
+        ? "Open this URL in your browser and sign in with Google. The localhost page may not load; paste its full callback URL (recommended) or authorization code here."
+        : "Sign in with your Google account in the browser; it comes back here when you're done.",
+      method: this.manual ? "code" : "auto",
+      callback: (code, { signal } = {}) => {
+        if (!this.result) {
+          this.watch(signal)
+          this.result = this.complete(code)
+        }
+        return this.result
+      },
     }
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(PAGE(!err, err ?? ""))
-    got({ code, err })
-  })
-  const redirect = `http://localhost:${port}/oauth-callback`
-  const q = new URLSearchParams({
-    client_id: CLIENT_ID,
-    redirect_uri: redirect,
-    response_type: "code",
-    scope: SCOPES.join(" "),
-    access_type: "offline",
-    prompt: "consent",
-    state,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  })
-  return {
-    url: `${AUTH_URL}?${q}`,
-    instructions: "Sign in with your Google account in the browser; it comes back here when you're done.",
-    method: "auto",
-    async callback() {
-      let timer
-      try {
-        const cb = await Promise.race([back, new Promise((r) => (timer = setTimeout(() => r(null), SIGN_IN_TIMEOUT)))])
-        if (!cb) return { type: "failed", error: "the sign-in timed out" }
-        if (cb.err) return { type: "failed", error: `Google: ${cb.err}` }
-        const t = await postForm(TOKEN_URL, { grant_type: "authorization_code", code: cb.code, redirect_uri: redirect, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: verifier })
-        if (!t.access_token || !t.refresh_token) return { type: "failed", error: "Google sent back no token" }
-        const expires = Date.now() + (Number(t.expires_in) || 3600) * 1000
-        tokens.set(t.refresh_token, { access: t.access_token, expires })
-        return await signedIn(t.refresh_token, t.access_token, expires, "")
-      } catch (e) {
-        return { type: "failed", error: e?.message ?? String(e) }
-      } finally {
-        clearTimeout(timer)
-        close()
-      }
-    },
+  }
+
+  async complete(input) {
+    const signal = this.controller.signal
+    try {
+      signal.throwIfAborted()
+      let cb
+      if (this.manual) {
+        const code = String(input ?? "").trim()
+        if (!code) throw new Error("paste the callback URL or authorization code")
+        cb = /^[a-z][a-z\d+.-]*:/i.test(code) ? this.reply(new URL(code)) : { code }
+      } else cb = await this.back
+      signal.throwIfAborted()
+      if (cb.err) return { type: "failed", error: `Google: ${cb.err}` }
+      const t = await postForm(TOKEN_URL, { grant_type: "authorization_code", code: cb.code, redirect_uri: this.redirect, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: this.verifier }, signal)
+      signal.throwIfAborted()
+      if (!t.access_token || !t.refresh_token) return { type: "failed", error: "Google sent back no token" }
+      const expires = Date.now() + (Number(t.expires_in) || 3600) * 1000
+      tokens.set(t.refresh_token, { access: t.access_token, expires })
+      return await signedIn(t.refresh_token, t.access_token, expires, "", undefined, signal)
+    } catch (e) {
+      return { type: "failed", error: e?.message ?? String(e) }
+    } finally {
+      this.close()
+    }
+  }
+}
+
+async function signIn(_inputs, { signal } = {}, manual = false) {
+  let attempt
+  try {
+    signal?.throwIfAborted()
+    attempt = new SignInAttempt(manual, signal)
+    return await attempt.authorize()
+  } catch (e) {
+    attempt?.close()
+    return { type: "failed", error: e?.message ?? String(e) }
   }
 }
 
 // imported is the first account of a pasted export: a JSON account or
 // list of them (Antigravity tools' exports: refresh_token, project_id,
-// email, perhaps under token or accounts), or bare refresh tokens, one a
-// line
+// email, perhaps under token or accounts), sub2api Antigravity OAuth
+// accounts, or bare refresh tokens, one a line
 function imported(text) {
   text = String(text ?? "").trim()
   const j = parse(text)
   const found = []
-  const take = (o) => {
+  const take = (o, sub2api = false) => {
     if (!isObj(o)) return
+    if (o.type === "sub2api-data") {
+      if (o.version !== undefined && o.version !== 1) throw new Error("this sub2api export version isn't supported")
+      if (Array.isArray(o.accounts)) o.accounts.forEach((a) => take(a, true))
+      return
+    }
+    // decision: recognize sub2api by its platform and OAuth type; not any
+    // credentials object because other providers export refresh tokens too.
+    if (sub2api || "platform" in o || "credentials" in o) {
+      if (o.platform !== "antigravity" || o.type !== "oauth" || !isObj(o.credentials)) return
+      const t = o.credentials
+      if (typeof t.refresh_token === "string" && t.refresh_token.trim()) found.push({ rt: t.refresh_token.trim(), project: t.project_id ?? "", email: t.email ?? "" })
+      return
+    }
     if (typeof o.type === "string" && o.type && o.type.toLowerCase() !== "antigravity") throw new Error(`this is a ${o.type} account, not Antigravity's`)
     const t = isObj(o.token) ? o.token : o
     const rt = t.refresh_token ?? t.refreshToken ?? o.refresh_token ?? o.refreshToken
@@ -2062,9 +2157,9 @@ function imported(text) {
       found.push({ rt, project: t.project_id ?? t.projectId ?? t.project ?? o.project_id ?? o.projectId ?? o.project ?? "", email: o.email ?? t.email ?? "" })
       return
     }
-    if (Array.isArray(o.accounts)) o.accounts.forEach(take)
+    if (Array.isArray(o.accounts)) o.accounts.forEach((a) => take(a))
   }
-  if (Array.isArray(j)) j.forEach(take)
+  if (Array.isArray(j)) j.forEach((a) => take(a))
   else if (isObj(j)) take(j)
   else if (j === undefined) {
     for (const line of text.split(/\r?\n/)) {
@@ -2075,25 +2170,31 @@ function imported(text) {
   return found
 }
 
-async function importAccount(inputs) {
+async function importAccount(inputs, { signal } = {}) {
   let found
   try {
+    signal?.throwIfAborted()
     found = imported(inputs?.account)
   } catch (e) {
-    return { type: "failed", error: e.message }
+    return { type: "failed", error: e?.message ?? String(e) }
   }
   if (!found.length) return { type: "failed", error: "no refresh token in what was pasted" }
   const a = found[0]
+  let result
   return {
     url: "",
     instructions: "Checking the account with Google…",
     method: "auto",
-    async callback() {
-      try {
-        return await signedIn(a.rt, "", 0, typeof a.project === "string" ? a.project : "", a.email)
-      } catch (e) {
-        return { type: "failed", error: e?.message ?? String(e) }
-      }
+    callback(_code, { signal: callbackSignal } = {}) {
+      if (!result) result = (async () => {
+        try {
+          const cancel = signal && callbackSignal ? AbortSignal.any([signal, callbackSignal]) : signal ?? callbackSignal
+          return await signedIn(a.rt, "", 0, typeof a.project === "string" ? a.project : "", a.email, cancel)
+        } catch (e) {
+          return { type: "failed", error: e?.message ?? String(e) }
+        }
+      })()
+      return result
     },
   }
 }
@@ -2282,6 +2383,7 @@ export async function AntigravityAuthPlugin({ client, magpie } = {}) {
           prompts: [{ type: "text", key: "account", message: "A refresh token, or an exported account's JSON" }],
           authorize: importAccount,
         },
+        { type: "oauth", label: "Sign in with Google (paste callback URL or code)", authorize: (inputs, options) => signIn(inputs, options, true) },
       ],
       async loader(getAuth) {
         if (!stateOf(await getAuth())) return {}

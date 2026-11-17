@@ -19,9 +19,9 @@ export function fake(replies = {}) {
     const headers = Object.fromEntries(Object.entries(init.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]))
     const m = /\/v1internal:([a-zA-Z]+)/.exec(url)
     const name = m ? m[1] : url.startsWith("https://oauth2.googleapis.com/token") ? "token" : url.includes("userinfo") ? "who" : url
-    seen.push({ name, url, body, headers, json: (() => { try { return JSON.parse(body) } catch { return undefined } })() })
+    seen.push({ name, url, body, headers, signal: init.signal, json: (() => { try { return JSON.parse(body) } catch { return undefined } })() })
     let r = replies[name]
-    if (typeof r === "function") r = r(seen[seen.length - 1], seen)
+    if (typeof r === "function") r = await r(seen[seen.length - 1], seen)
     if (r === undefined) {
       if (name === "token") r = { access_token: "tok-new", expires_in: 3600 }
       else if (name === "loadCodeAssist") r = { cloudaicompanionProject: "ag-proj", currentTier: { id: "free-tier", name: "Antigravity" } }
