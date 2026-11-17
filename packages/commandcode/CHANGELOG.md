@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.25
+
+- Generation and System One requests use the Command Code 1.89.2 identity.
+  Their project slug follows the CLI's full-path slugification, including
+  Unicode transliteration, instead of using the folder's last segment.
+- Browser and CLI sign-in cancellation stops validation and retry waits;
+  completion is reused, and the browser callback listener closes after
+  cancellation, failure or expiry. Successful callbacks keep their local
+  completion page for at most 10 seconds.
+
 ## 0.1.24
 
 - A Go, GOAT or Pro account's Credits window tells its count as well as

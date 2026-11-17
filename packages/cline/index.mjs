@@ -34,9 +34,9 @@ const DEVICE_CAP = 600 // seconds the browser may take, however long the code li
 // CLIENT is who every request says it comes from: the same client surface
 // Cline's own CLI runs as, headers down (apps/cli registers exactly this
 // identity, and the free models' gate reads these). Pinned to Cline's current
-// release — when they ship a new one, move these along (the numbers are the
-// only thing that has to match).
-const CLIENT = { type: "cline-cli", version: "3.0.68", platform: "cli", core: "0.0.90" }
+// release; the headers below follow @cline/llms's resolveProviderRequestHeaders.
+// cline@3.0.74 ships @cline/core and @cline/llms 0.2.0 (npm release tarballs).
+const CLIENT = { type: "cline-cli", version: "3.0.74", platform: "cli", core: "0.2.0" }
 
 // Pass the host's session through the chat.headers hook to the loader's
 // fetch. This private header never leaves the plugin.

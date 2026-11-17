@@ -10,42 +10,44 @@
 // Responses at /provider/v1, Anthropic's Messages at /provider/v1/messages,
 // the key in Authorization and x-api-key. Go's key has no Provider API: it
 // is only taken where the CLI itself asks, POST /alpha/generate, in the
-// CLI's own format (command-code 1.72.2), which the fetch here writes from
+// CLI's own format (command-code 1.89.2), which the fetch here writes from
 // the chat completion OpenCode sends and turns back into one.
 //
 // Zero Data Retention (commandcode.ai/docs/resources/zdr) is asked for as
 // the CLI asks it: x-cmd-zdr: 1 on every request for a reply, the Provider
 // API's and /alpha/generate's alike (command-code's buildCommandAuthHeaders
-// on CMD_ZDR=1: 1.84.0's bundle, and 1.74.1 as captured). It is on when the user turns on the provider's "Zero Data
-// Retention" switch in magpie, or when CMD_ZDR is "1" in the environment,
+// on CMD_ZDR=1, checked against the 1.89.2 release bundle). It is on when
+// the user turns on the provider's "Zero Data Retention" switch in magpie,
+// or when CMD_ZDR is "1" in the environment,
 // as for the CLI.
 import { createServer, STATUS_CODES } from "node:http"
 import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { basename, join } from "node:path"
+import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
+import slugify from "@sindresorhus/slugify"
 
 const ID = "commandcode-plan"
 const API = "https://api.commandcode.ai"
 const STUDIO = "https://commandcode.ai"
 const BASE = API + "/provider/v1"
-const CLI_VERSION = "1.72.2"
+// decision: one released CLI identity for generation and System One; not
+// route-specific pins because command-code@1.89.2 uses the same auth headers.
+const CLI_VERSION = "1.89.2"
 const MAX_TOKENS = 64000 // the CLI's max_tokens when none is asked
 // MAX_OUTPUT is the most max_tokens Command Code takes at /alpha/generate,
 // for any model: more is refused, the whole request with it ("Too big:
 // expected number to be <=200000 at params.max_tokens") — magpie's
 // CommandCodeMaxOutput
 const MAX_OUTPUT = 200_000
-// TypeSafe's System One, as the CLI asks it (command-code 1.88.2:
+// TypeSafe's System One, as the CLI asks it (command-code 1.89.2:
 // SYSTEM_ONE_ROUTE "/provider/v1/systemone", SYSTEM_ONE_MODELS
 // ["typesafe/jev"]): a decision model, which answers typed questions
 // ({state, questions}) with probabilities and holds no conversation. Its
-// list (/provider/v1/models) doesn't name it. SYSTEM_ONE_CLI is the CLI
-// whose request this is, sent as its x-command-code-version.
+// list (/provider/v1/models) doesn't name it.
 const JEV = "typesafe/jev"
 const SYSTEM_ONE = BASE + "/systemone"
-const SYSTEM_ONE_CLI = "1.88.2"
 // the CLI's resolveSystemOneModel table
 const JEV_NAMES = { jev: JEV, "jev-latest": JEV, [JEV]: JEV, "typesafe-ai/jev": JEV }
 const JEV_MODEL = { id: JEV, name: "Jev", context: 0, decides: true }
@@ -1234,19 +1236,17 @@ function zdrOn(magpie) {
   return process.env.CMD_ZDR === "1"
 }
 
-// projectSlug is the CLI's x-project-slug for a working directory: its
-// last segment, "root" when it has none (getProjectDirName's slugify of
-// basename(cwd)); a Windows folder's too, as the CLI's win32 basename
-// splits it. A name a header can't carry (past Latin-1: the CLI's own
-// request fails there, Node refusing the header) goes percent-encoded.
+// projectSlug is command-code@1.89.2's getProjectDirName: slugify the
+// whole cwd, or "root" when nothing remains.
+// decision: reuse the CLI's slugifier; not a local approximation because
+// full-path, Unicode and camelcase rules are part of its request identity.
 function projectSlug(dir) {
-  const name = basename(String(dir || homedir()).replaceAll("\\", "/")) || "root"
-  return /^[\x20-\x7e\xa0-\xff]*$/.test(name) ? name : encodeURIComponent(name)
+  return slugify(String(dir || homedir())) || "root"
 }
 
-// generateHeaders are the CLI's own (buildCommandAuthHeaders), with its
-// x-cmd-zdr: 1 when ZDR is on; the project slug is the working folder's
-// name, as the CLI's is.
+// generateHeaders are command-code@1.89.2's buildCommandAuthHeaders,
+// with x-cmd-zdr: 1 when ZDR is on. x-cli-surface is absent in the ordinary
+// CLI; the release only sets it for its ACP and RPC entrypoints.
 const generateHeaders = (key, zdr = false, place = {}) => ({
   "Content-Type": "application/json",
   "User-Agent": "cli",
@@ -1563,7 +1563,7 @@ async function systemOne(key, init, input, place, zdr) {
   const model = JEV_NAMES[String(ask.model ?? "").toLowerCase()] ?? ask.model ?? JEV
   const res = await fetch(SYSTEM_ONE, {
     method: "POST",
-    headers: { ...generateHeaders(key, zdr, place), "x-command-code-version": SYSTEM_ONE_CLI },
+    headers: generateHeaders(key, zdr, place),
     body: JSON.stringify({ ...ask, model }),
     signal: init.signal,
   })

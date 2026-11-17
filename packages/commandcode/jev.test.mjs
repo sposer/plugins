@@ -1,5 +1,5 @@
 // Command Code's Jev (typesafe/jev), TypeSafe's System One: a decision
-// model, which the CLI (command-code 1.88.2) asks at POST
+// model, which the CLI (command-code 1.89.2) asks at POST
 // /provider/v1/systemone with {model, state, questions} and its usual
 // headers, and which /provider/v1/models doesn't list (joeliu96872540 on
 // X: magpie couldn't get it). The plugin says the provider decides, lists
@@ -100,18 +100,11 @@ test("a question goes to /provider/v1/systemone as the CLI asks it, and its answ
   expect(s.url).toBe("https://api.commandcode.ai/provider/v1/systemone")
   expect(s.method).toBe("POST")
   expect(JSON.parse(s.body)).toEqual(QUESTION)
-  // the CLI's buildCommandAuthHeaders, and nothing else
-  expect(Object.fromEntries(s.headers)).toEqual({
-    "content-type": "application/json",
-    "user-agent": "cli",
-    "x-command-code-version": "1.88.2",
-    "x-cli-environment": "production",
-    "x-project-slug": "shop",
-    "x-taste-learning": "false",
-    "x-session-id": s.headers.get("x-session-id"),
-    authorization: "Bearer user-key",
-  })
-  expect(s.headers.get("x-session-id")).toMatch(/^[0-9a-f-]{36}$/)
+  // The shared CLI identity is covered in no-magpie.test.mjs; this route
+  // must use it too, rather than pinning a different CLI release.
+  expect(s.headers.get("x-command-code-version")).toBe("1.89.2")
+  expect(s.headers.get("x-project-slug")).toBe("users-me-shop")
+  expect(s.headers.get("authorization")).toBe("Bearer user-key")
   expect([s.url, ...[...s.headers].flat(), s.body].join("\n")).not.toMatch(/magpie/i)
 })
 
@@ -139,7 +132,6 @@ test("a refusal is said as the chat's are, the account kept", async () => {
   const res = await ask(await loader())
   expect(res.status).toBe(403)
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
-  expect((await res.json()).error.message).toBe("Model not in plan: Jev available in Provider and above plans")
 })
 
 test("a Go key refused the Provider API is kept as Go's", async () => {

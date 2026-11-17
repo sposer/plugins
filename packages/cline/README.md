@@ -47,10 +47,14 @@ workos:<access token>` for a signed-in account or the raw API key, and the
 full client-identity header set Cline's own clients send (`HTTP-Referer`,
 `X-Title`, `User-Agent: Cline/<version>`, `X-CLIENT-TYPE: cline-cli`,
 `X-CLIENT-VERSION`, `X-PLATFORM`, `X-PLATFORM-VERSION`, `X-CORE-VERSION`,
-`X-IS-MULTIROOT`) — pinned to Cline's current CLI release, which is also
-what the free models' gate reads; when Cline ships a new release, move the
-pinned numbers in `index.mjs` along. All models use one `X-Task-ID` per
-named chat session, derived as a UUID from the session. With no named session
+`X-IS-MULTIROOT`) — pinned to [Cline CLI 3.0.74](https://registry.npmjs.org/cline/3.0.74)
+and its core 0.2.0. The header contract is the release's
+[@cline/llms 0.2.0](https://registry.npmjs.org/@cline/llms/0.2.0)
+`resolveProviderRequestHeaders`, with the CLI's `cline-cli` identity. This
+is also what the free models' gate reads; when Cline ships a new release,
+check that contract and move the pinned numbers in `index.mjs` along.
+All models use one `X-Task-ID` per named chat session, derived as a UUID
+from the session. With no named session
 (including magpie's synthetic id from the first user message), no task id
 is sent. The session crosses the plugin's hooks in a private header that is
 removed before the request goes to Cline. Auth and account requests carry

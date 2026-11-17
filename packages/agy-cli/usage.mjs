@@ -354,9 +354,10 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token"
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep" + ".apps.googleusercontent.com"
 const CLIENT_SECRET = ["GOCSPX", "K58FWR486LdLJ1mLB8sXC4z6qDAf"].join("-")
 // The build changelist each agy release puts in its User-Agent (cl=), read
-// from its requests; a release not listed goes with the newest known one.
-const CLS = { "1.5.9": "1021519450" }
-const NEWEST_CL = "1021519450"
+// from its requests; 1.5.10 was recorded against a local Code Assist endpoint.
+// A release not listed goes with the newest known one.
+const CLS = { "1.5.9": "1021519450", "1.5.10": "1023297289" }
+const NEWEST_CL = CLS["1.5.10"]
 const GOOS = { darwin: "darwin", linux: "linux", win32: "windows" }
 const GOARCH = { arm64: "arm64", x64: "amd64" }
 

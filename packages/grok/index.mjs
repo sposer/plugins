@@ -16,7 +16,7 @@ import { STATUS_CODES } from "node:http"
 
 const PROVIDER = "grok"
 const BASE = "https://cli-chat-proxy.grok.com/v1"
-const CLIENT_VERSION = "1.0.41"
+const CLIENT_VERSION = "1.0.88" // https://x.ai/cli/stable
 const CPA_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const CPA_SCOPE = `https://auth.x.ai::${CPA_CLIENT_ID}`
 const LOOP_CHECKS = [["x-grok-doom-loop-check", "1024"], ["x-grok-exact-repetition-check", "64"]]
@@ -349,7 +349,7 @@ async function clientVersion() {
   let v = CLIENT_VERSION
   const exe = executable()
   if (exe) {
-    const { err, stdout } = await run(exe, ["--version"], { timeout: 5000 }) // "grok 1.0.41 (4220f3b224a6)"
+    const { err, stdout } = await run(exe, ["--version"], { timeout: 5000 }) // "grok 1.0.88 (2fe3608f7398)"
     const got = !err && stdout.match(/\d+\.\d+\.\d+/)?.[0]
     if (got && newer(got, v)) v = got
   }
@@ -364,15 +364,18 @@ function newer(a, b) {
 }
 
 // headers say a request comes from the Grok CLI.
-async function sign(headers, key) {
+async function sign(headers, key, url) {
   const v = await clientVersion()
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform
-  const arch = { arm64: "aarch64", x64: "x86_64", ia32: "386" }[process.arch] ?? process.arch
+  const arch = { arm64: "aarch64", x64: "x86_64", ia32: "x86" }[process.arch] ?? process.arch
   headers.set("Authorization", `Bearer ${key}`)
   headers.set("x-grok-client-version", v)
   headers.set("x-xai-token-auth", "xai-grok-cli")
   headers.set("x-grok-client-identifier", "grok-shell")
   headers.set("x-grok-client-mode", "headless")
+  // Grok Build's agent/proxy_headers.rs adds this auth marker only at the
+  // CLI proxy boundary; STT goes directly to api.x.ai, without it.
+  if (new URL(url).hostname === new URL(BASE).hostname) headers.set("x-authenticateresponse", "authenticate-response")
   headers.set("User-Agent", `grok-shell/${v} (${os}; ${arch})`)
 }
 
@@ -583,7 +586,7 @@ const DEFAULT_MODELS = {
 // (listed hardest first, kept easiest first).
 async function listModels(key) {
   const headers = new Headers()
-  await sign(headers, key)
+  await sign(headers, key, BASE)
   const res = await fetch(`${BASE}/models`, { headers })
   const text = await res.text()
   // a token Grok turned away before its time: the caller has Grok Build
@@ -1238,7 +1241,7 @@ async function transcribe(auth, req, init) {
   let c = await token(home)
   const send = async (key) => {
     const headers = new Headers()
-    await sign(headers, key)
+    await sign(headers, key, STT)
     return fetch(STT, { method: "POST", headers, body: ask.form, signal: init?.signal })
   }
   let res = await send(c.key)
@@ -1483,7 +1486,7 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
             headers.delete("content-length")
             let at = 0 // when the last request went out, signed
             const send = async (key) => {
-              await sign(headers, key)
+              await sign(headers, key, req.url)
               at = Date.now()
               return fetch(req.url, { ...init, method: req.method, headers, body })
             }

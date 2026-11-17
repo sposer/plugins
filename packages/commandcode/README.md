@@ -43,7 +43,7 @@ on the request's answer). A clean usage read takes the mark off.
   - The other models speak chat completions.
 - **Go** has no Provider API access. Its key is only accepted where the CLI
   asks, `POST /alpha/generate`, in the CLI's own format (command-code
-  1.72.2 and its headers). The plugin's `fetch` handles this:
+  1.89.2 and its headers). The plugin's `fetch` handles this:
   - It turns OpenCode's chat completion into that format.
   - It turns the line-by-line reply back into a chat completion, streamed
     or not.
@@ -59,6 +59,13 @@ When the plan isn't known yet and the Provider API refuses the key with
 "Your Go plan doesn't include API access", the key is taken as Go's from
 then on (and saved so with it), and a chat completion is sent again to
 `/alpha/generate`.
+
+Generation and System One use the identity headers from the
+[command-code 1.89.2 release](https://registry.npmjs.org/command-code/1.89.2)
+(`dist/cli.mjs`: `resolveCommandAuthHeaders` and `buildCommandAuthHeaders`).
+`x-project-slug` is the full working path processed by the CLI's
+`@sindresorhus/slugify`, not just its last segment. These ordinary CLI
+requests omit `x-cli-surface`, which the release sets only for ACP and RPC.
 
 ## Zero Data Retention
 
@@ -146,8 +153,8 @@ adds it to every plan's list, marked `decides`, and sets `decide` on the
 provider. magpie then offers it as a routing group's classifier and at its
 `/v1/systemone` (as `commandcode-plan/typesafe/jev`), never to an agent to
 chat with. A question goes to `POST /provider/v1/systemone` as the CLI
-(1.88.2) sends it, with the CLI's headers, and Zero Data Retention when the
-switch is on. Command Code decides which plans may use it; a refusal reaches
+sends it, with the CLI identity described under Requests, and Zero Data
+Retention when the switch is on. Command Code decides which plans may use it; a refusal reaches
 magpie with its status, as a chat's does.
 
 ## Not included

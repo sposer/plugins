@@ -2,16 +2,21 @@
 // the Go catalog's User-Agent and as every /alpha/generate request's
 // x-project-slug. Nothing that goes upstream names the app: the catalog is
 // asked as the CLI asks it (Node's fetch, "node") and the slug is the
-// working folder's name, as the CLI's (basename(cwd) || "root").
-import { afterEach, expect, test } from "bun:test"
-import { basename } from "node:path"
-import { homedir } from "node:os"
+// full working path slugified as command-code@1.89.2 does.
+import { afterEach, beforeEach, expect, test } from "bun:test"
 import { CommandCodePlugin, _internal } from "./index.mjs"
 
 const real = globalThis.fetch
+let zdr
+beforeEach(() => {
+  zdr = process.env.CMD_ZDR
+  delete process.env.CMD_ZDR
+})
 afterEach(() => {
   globalThis.fetch = real
   _internal.subsSeen.clear()
+  if (zdr === undefined) delete process.env.CMD_ZDR
+  else process.env.CMD_ZDR = zdr
 })
 
 const finish = JSON.stringify({ type: "finish", finishReason: "stop", totalUsage: { inputTokens: 3, outputTokens: 1 } })
@@ -51,7 +56,6 @@ async function chat(plan, dir) {
 test("no request to Command Code names magpie: Go, Provider API and the catalog (#352)", async () => {
   const sent = record()
   await chat("Go", "/Users/me/shop")
-  await chat("Go")
   await chat("Pro", "/Users/me/shop")
   await _internal.goModels()
   expect(sent.some((s) => s.path === "/alpha/generate")).toBe(true)
@@ -59,16 +63,29 @@ test("no request to Command Code names magpie: Go, Provider API and the catalog 
   for (const s of sent) expect(upstream(s)).not.toMatch(/magpie/i)
 })
 
-test("the project slug is the working folder's name, as the CLI's", async () => {
+test("Go requests use the released CLI identity and its full-path project slug", async () => {
   const sent = record()
   await chat("Go", "/Users/me/shop")
-  await chat("Go")
-  const slugs = sent.filter((s) => s.path === "/alpha/generate").map((s) => s.headers.get("x-project-slug"))
-  expect(slugs).toEqual(["shop", basename(homedir()) || "root"])
+  await chat("Go", "/Else/shop")
+  const [first, second] = sent.filter((s) => s.path === "/alpha/generate")
+  expect(Object.fromEntries(first.headers)).toEqual({
+    "content-type": "application/json",
+    "user-agent": "cli",
+    "x-command-code-version": "1.89.2",
+    "x-cli-environment": "production",
+    "x-project-slug": "users-me-shop",
+    "x-taste-learning": "false",
+    "x-session-id": first.headers.get("x-session-id"),
+    authorization: "Bearer k",
+  })
+  expect(first.headers.get("x-session-id")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  expect(second.headers.get("x-session-id")).toBe(first.headers.get("x-session-id"))
+  expect(second.headers.get("x-project-slug")).toBe("else-shop")
   expect(_internal.projectSlug("/")).toBe("root")
-  expect(_internal.projectSlug("C:\\Users\\me\\proj")).toBe("proj")
-  expect(_internal.projectSlug("/Users/me/café")).toBe("café")
-  expect(_internal.projectSlug("/Users/me/项目")).toBe(encodeURIComponent("项目"))
+  expect(_internal.projectSlug("C:\\Users\\me\\MyProject")).toBe("c-users-me-my-project")
+  expect(_internal.projectSlug("/Users/me/café")).toBe("users-me-cafe")
+  expect(_internal.projectSlug("/Users/me/项目")).toBe("users-me")
+  expect(_internal.projectSlug("/я люблю единорогов")).toBe("ya-lyublyu-edinorogov")
 })
 
 test("the catalog is asked as the CLI's Node fetch asks it", async () => {

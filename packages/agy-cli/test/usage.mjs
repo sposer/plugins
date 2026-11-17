@@ -913,6 +913,8 @@ test("an account agy refuses for its region has its quota read the way agy reads
 })
 
 test("the direct read's User-Agent is agy's", () => {
+  assert.equal(quotaUserAgent("1.5.10", "consumer", "win32", "x64"),
+    "antigravity/cli/1.5.10 (aidev_client; os_type=windows; arch=amd64; cl=1023297289; auth_method=consumer)")
   assert.equal(quotaUserAgent("1.5.9", "consumer", "darwin", "arm64"),
     "antigravity/cli/1.5.9 (aidev_client; os_type=darwin; arch=arm64; cl=1021519450; auth_method=consumer)")
   assert.match(quotaUserAgent("1.6.0", "", "win32", "x64"), /^antigravity\/cli\/1\.6\.0 \(aidev_client; os_type=windows; arch=amd64; cl=\d+; auth_method=consumer\)$/)

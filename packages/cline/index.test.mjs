@@ -192,10 +192,9 @@ test("one task id per named session, no task id without one, and no private head
 
 test("clientHeaders is the official client's set, task id only when asked", () => {
 	const h = clientHeaders()
-	// the numbers are what has to match: the CLI release, and the @cline/core
-	// that release ships (cline@3.0.68 depends on 0.0.90, not 3.0.67's 0.0.89)
-	expect(CLIENT.version).toBe("3.0.68")
-	expect(CLIENT.core).toBe("0.0.90")
+	// The npm CLI release and the @cline/core it ships identify the same client.
+	expect(CLIENT.version).toBe("3.0.74")
+	expect(CLIENT.core).toBe("0.2.0")
 	expect(h["X-CLIENT-TYPE"]).toBe("cline-cli")
 	expect(h["X-Task-ID"]).toBeUndefined()
 	expect(clientHeaders("task-1")["X-Task-ID"]).toBe("task-1")
