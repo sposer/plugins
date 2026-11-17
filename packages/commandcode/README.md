@@ -11,12 +11,19 @@ An account is a Command Code API key. There are three ways to get one:
 - **Command Code (browser)**: the CLI's own sign-in. Studio asks you to
   approve a key for this machine, then posts it to a callback on
   `127.0.0.1`. The plugin checks the key with `/alpha/whoami` and reads the
-  plan.
+  plan. The callback listener expires after 10 minutes, even if completion
+  is never requested. A successful form callback redirects to the local
+  completion page, available for up to 10 seconds; cancellation, failure
+  and expiry close the listener without that window.
 - **Command Code CLI's sign-in**: takes the account `commandcode login`
   signed in to, from `~/.commandcode/auth.json`. The file is only read,
   never changed.
 - **API key**: paste a key from
   [commandcode.ai/settings/keys](https://commandcode.ai/settings/keys).
+
+Cancelling browser or CLI sign-in also stops in-flight key validation and
+its retry waits. Repeated completion reuses the same result instead of
+validating the key again.
 
 The key is kept where OpenCode keeps sign-ins (`auth.json`; in magpie,
 `plugin-auth.json`) as `{ "type": "api", "key", "metadata": { "email": <user>, "plan" } }`.

@@ -24,6 +24,7 @@ import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, join } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 
 const ID = "commandcode-plan"
 const API = "https://api.commandcode.ai"
@@ -474,10 +475,12 @@ async function keyRefused(key) {
   }
 }
 
-async function accountJSON(path, key, timeout = 15_000) {
+async function accountJSON(path, key, timeout = 15_000, signal) {
+  signal?.throwIfAborted()
+  const deadline = AbortSignal.timeout(timeout)
   const res = await fetch(API + path, {
     headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(timeout),
+    signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
   })
   if (!res.ok) {
     const e = new Error(`${path}: ${res.status}`)
@@ -522,15 +525,16 @@ const planName = (id) => planOf(id)[1]
 // subscriptionOf is the account's plan as billing/subscriptions says: its
 // id and name, when its period ends and whether it renews then; NO_PLAN
 // when it has none, undefined when it can't be read.
-async function subscriptionOf(key, timeout) {
+async function subscriptionOf(key, timeout, signal) {
   let d
   try {
-    const r = await accountJSON("/alpha/billing/subscriptions", key, timeout)
+    const r = await accountJSON("/alpha/billing/subscriptions", key, timeout, signal)
     // a 200 with success false when Command Code couldn't tell
     // ("write CONNECTION_CLOSED …"): unread, not no plan
     if (r?.success === false) return undefined
     d = r?.data
   } catch {
+    signal?.throwIfAborted()
     return undefined
   }
   if (d?.planId && d.status !== "canceled" && d.status !== "incomplete_expired") {
@@ -742,28 +746,32 @@ async function usage(key, saved) {
 // whoami turning the key down (401, 403) fails: it has answered a key just
 // made with a 500, so one that errs is asked again a few times, then
 // passed over for the name Studio sent with the key.
-async function signedIn(a) {
+async function signedIn(a, signal) {
+  signal?.throwIfAborted()
   let me
   for (let tries = 0; ; tries++) {
     try {
-      me = (await accountJSON("/alpha/whoami", a.apiKey))?.user
+      me = (await accountJSON("/alpha/whoami", a.apiKey, 15_000, signal))?.user
       break
     } catch (e) {
+      signal?.throwIfAborted()
       if (e.status === 401 || e.status === 403) throw new Error("Command Code didn't take the new key")
       if (tries >= 2) break
-      await new Promise((r) => setTimeout(r, 1000))
+      await delay(1000, undefined, { signal })
     }
   }
   const who = me?.userName || a.userName || me?.email || me?.id || a.userId || "Command Code"
-  const sub = await subscriptionOf(a.apiKey, 30_000)
+  const sub = await subscriptionOf(a.apiKey, 30_000, signal)
+  signal?.throwIfAborted()
   if (sub) subsSeen.set(a.apiKey, { sub, at: Date.now() })
   const plan = sub?.plan ?? ""
   return { who, plan, email: me?.email ?? "" }
 }
 
 // success is what a sign-in gives OpenCode: the key, and who it is.
-async function success(a) {
-  const { who, plan } = await signedIn(a)
+async function success(a, signal) {
+  const { who, plan } = await signedIn(a, signal)
+  signal?.throwIfAborted()
   const metadata = { email: who }
   if (a.userId) metadata.userId = a.userId
   if (a.keyName) metadata.keyName = a.keyName
@@ -785,15 +793,55 @@ function page(ok, title, text) {
 // browserSignIn is the CLI's: Studio asks the user to approve a key for
 // this machine, then posts it (a form, or JSON from an older Studio) to
 // the callback, which sends the browser on to a page saying how it went.
-async function browserSignIn() {
+async function browserSignIn(_inputs, { signal } = {}) {
+  if (signal?.aborted) return { type: "failed", error: signal.reason?.message ?? String(signal.reason) }
   const state = randomBytes(24).toString("base64url")
+  const controller = new AbortController()
+  const signals = new Map()
   let status = { state: "waiting" }
-  let settle
+  let ended = false, closed = false, timer, linger, settle
   const done = new Promise((r) => (settle = r))
-  const finish = (st, result) => {
-    if (status.state !== "waiting") return
+  const close = () => {
+    closed = true
+    clearTimeout(timer)
+    clearTimeout(linger)
+    for (const [signal, abort] of signals) signal.removeEventListener("abort", abort)
+    signals.clear()
+    controller.signal.removeEventListener("abort", aborted)
+    try { server.close(); server.closeAllConnections?.() } catch {}
+  }
+  const finish = (st, result, response) => {
+    if (ended) return false
+    ended = true
     status = st
+    clearTimeout(timer)
     settle(result)
+    if (st.state === "done") {
+      // decision: keep a bounded success-page window after Studio's 303;
+      // not close on every result because the browser still follows that redirect.
+      linger = setTimeout(close, 10_000)
+      linger.unref?.()
+    } else {
+      controller.abort(new Error(result.error))
+      server.close()
+      if (response && !response.writableFinished) {
+        response.once("finish", close)
+        response.once("close", close)
+      } else close()
+    }
+    return true
+  }
+  const aborted = () => {
+    if (ended) { if (status.state === "done") close(); return }
+    const error = controller.signal.reason?.message ?? String(controller.signal.reason)
+    finish({ state: "canceled", error }, { type: "failed", error })
+  }
+  const watch = (signal) => {
+    if (!signal || closed || signals.has(signal)) return
+    if (signal.aborted) { controller.abort(signal.reason); return }
+    const abort = () => controller.abort(signal.reason)
+    signals.set(signal, abort)
+    signal.addEventListener("abort", abort, { once: true })
   }
 
   const server = createServer(async (req, res) => {
@@ -814,16 +862,24 @@ async function browserSignIn() {
         : html(200, page(false, "Sign-in didn't finish", status.error || "Start it again."))
     }
     if (path === "/cancel") {
-      finish({ state: "canceled" }, { type: "failed", error: "the sign-in was canceled" })
-      return res.writeHead(204).end()
+      res.writeHead(204).end()
+      if (ended) close()
+      else finish({ state: "canceled" }, { type: "failed", error: "the sign-in was canceled" }, res)
+      return
     }
     if (path !== "/callback") return res.writeHead(404).end()
     if (req.method !== "POST") return res.writeHead(405).end()
 
     let raw = ""
-    for await (const chunk of req) {
-      raw += chunk
-      if (raw.length > 10_000) break
+    try {
+      for await (const chunk of req) {
+        raw += chunk
+        if (raw.length > 10_000) break
+      }
+    } catch (e) {
+      const error = e?.message ?? String(e)
+      finish({ state: "failed", error }, { type: "failed", error })
+      return
     }
     const isJSON = String(req.headers["content-type"] ?? "").trim().toLowerCase().startsWith("application/json")
     let got = {}
@@ -833,6 +889,7 @@ async function browserSignIn() {
       } catch {}
     } else got = Object.fromEntries(new URLSearchParams(raw))
     const answer = (ok, msg) => {
+      if (res.destroyed || res.writableEnded) return
       if (isJSON) {
         res.writeHead(ok ? 200 : 400, { "Content-Type": "application/json" })
         return res.end(JSON.stringify({ success: ok, error: msg }))
@@ -844,58 +901,75 @@ async function browserSignIn() {
     if (status.state !== "waiting") return answer(false, "this sign-in is over")
     if (got.error) {
       const msg = got.error === "access_denied" ? "the sign-in was denied" : got.error_description || got.error
-      finish({ state: "failed", error: msg }, { type: "failed", error: msg })
-      return answer(false, msg)
+      answer(false, msg)
+      finish({ state: "failed", error: msg }, { type: "failed", error: msg }, res)
+      return
     }
     if (!got.apiKey) return answer(false, "Command Code sent back no key")
+    status = { state: "checking" }
     try {
-      const r = await success({ apiKey: got.apiKey, userId: got.userId, userName: got.userName, keyName: got.keyName })
-      finish({ state: "done", who: r.metadata.email }, r)
-      answer(true, "")
+      const r = await success({ apiKey: got.apiKey, userId: got.userId, userName: got.userName, keyName: got.keyName }, controller.signal)
+      if (finish({ state: "done", who: r.metadata.email }, r)) answer(true, "")
     } catch (e) {
-      finish({ state: "failed", error: e.message }, { type: "failed", error: e.message })
-      answer(false, e.message)
+      const error = e?.message ?? String(e)
+      answer(false, error)
+      finish({ state: "failed", error }, { type: "failed", error }, res)
     }
   })
-  await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", resolve)
-  })
+  controller.signal.addEventListener("abort", aborted, { once: true })
+  watch(signal)
+  try {
+    // Closing during startup can suppress the listening callback.
+    await Promise.race([new Promise((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(0, "127.0.0.1", resolve)
+    }), done])
+    if (controller.signal.aborted) { close(); return await done }
+  } catch (e) {
+    const error = e?.message ?? String(e)
+    finish({ state: "failed", error }, { type: "failed", error })
+    close()
+    return await done
+  }
   const port = server.address().port
-  const timer = setTimeout(() => finish({ state: "failed", error: "the sign-in timed out" }, { type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
-  // the browser comes back for its page after the key: the server stays
-  // up a while for it
-  done.then(() => {
-    clearTimeout(timer)
-    setTimeout(() => server.close(), 10_000).unref?.()
-  })
+  timer = setTimeout(() => controller.abort(new Error("the sign-in timed out")), SIGN_IN_TIMEOUT)
+  timer.unref?.()
   const q = new URLSearchParams({ callback: `http://127.0.0.1:${port}/callback`, state, mode: "redirect" })
   return {
     url: `${STUDIO}/studio/auth/cli?${q}`,
     instructions: "Approve the key for this machine in Command Code Studio.",
     method: "auto",
-    callback: () => done,
+    callback: (_code, { signal } = {}) => { watch(signal); return done },
   }
 }
 
 // cliSignIn takes the account Command Code's CLI is signed in to, reading
 // ~/.commandcode/auth.json and changing nothing.
-async function cliSignIn() {
+async function cliSignIn(_inputs, { signal } = {}) {
+  if (signal?.aborted) return { type: "failed", error: signal.reason?.message ?? String(signal.reason) }
   const path = join(homedir(), ".commandcode", "auth.json")
+  let result
   return {
     url: "",
     instructions: `Uses the account in ${path}.`,
     method: "auto",
-    callback: async () => {
-      try {
-        const a = JSON.parse(await readFile(path, "utf8"))
-        if (!String(a?.apiKey ?? "").trim()) return { type: "failed", error: `Command Code's CLI isn't signed in: ${path} has no key` }
-        const r = await success(a)
-        r.metadata.cli = true
-        return r
-      } catch (e) {
-        return { type: "failed", error: e?.code === "ENOENT" ? "Command Code's CLI isn't signed in: run `commandcode login`" : e instanceof SyntaxError ? `${path} can't be read` : e.message }
-      }
+    callback: (_code, { signal: callbackSignal } = {}) => {
+      if (!result) result = (async () => {
+        const cancel = signal && callbackSignal ? AbortSignal.any([signal, callbackSignal]) : signal ?? callbackSignal
+        try {
+          cancel?.throwIfAborted()
+          const a = JSON.parse(await readFile(path, { encoding: "utf8", signal: cancel }))
+          cancel?.throwIfAborted()
+          if (!String(a?.apiKey ?? "").trim()) return { type: "failed", error: `Command Code's CLI isn't signed in: ${path} has no key` }
+          const r = await success(a, cancel)
+          cancel?.throwIfAborted()
+          r.metadata.cli = true
+          return r
+        } catch (e) {
+          return { type: "failed", error: e?.code === "ENOENT" ? "Command Code's CLI isn't signed in: run `commandcode login`" : e instanceof SyntaxError ? `${path} can't be read` : e?.message ?? String(e) }
+        }
+      })()
+      return result
     },
   }
 }
