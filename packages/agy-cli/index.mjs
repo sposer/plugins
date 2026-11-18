@@ -6155,8 +6155,20 @@ async function measuredUsage(turn, step, content, result) {
   if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) return null
   const last = steps.at(-1)
   // Store field 3 (output) already includes field 9 (thinking), matching ACP's outputTokens.
-  const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
-  const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
+  let output = 0
+  let thinking = 0
+  // decision: report preceding calls as magpie_deferred; not sum their input into
+  // the window because callers use that window for compaction.
+  // Output already includes all calls, so only input/cache is deferred.
+  const deferred = { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0, cache_write_tokens: 0 }
+  for (const item of steps) {
+    output += Math.max(item.output, item.thinking)
+    thinking += item.thinking
+    if (item === last) continue
+    deferred.prompt_tokens += item.input + item.read + item.write
+    deferred.cached_tokens += item.read
+    deferred.cache_write_tokens += item.write
+  }
   turn.stepCursor = { source: batch.source, idx: last.idx }
   turn.measured = { prompt }
   if (final) turn.stepUsageReconciled = true
@@ -6176,6 +6188,7 @@ async function measuredUsage(turn, step, content, result) {
     cache_creation_input_tokens: last.write,
     output_tokens: output,
     ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+    ...(deferred.prompt_tokens > 0 ? { magpie_deferred: deferred } : {}),
   }
 }
 

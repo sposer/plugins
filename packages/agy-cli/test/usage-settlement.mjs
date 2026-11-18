@@ -1232,6 +1232,67 @@ test("SQLite gen_metadata 步级落盘：tool_use 中间步直接读取真实缓
   })
 })
 
+for (const stream of [true, false]) {
+  for (const billPrior of [true, false]) {
+    test(`SQLite gen_metadata magpie_deferred (${stream ? "STREAM" : "JSON"}, ${billPrior ? "all categories" : "zero extra input/cache"})`, { skip: !openSqlite }, async () => {
+      const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n = Math.floor(n / 128) } out.push(n); return out }
+      const field = (n, bytes) => [n * 8 + 2, ...varint(bytes.length), ...bytes]
+      const genBlob = ({ input, output, write, read, thinking }) => new Uint8Array(field(1, field(4, [
+        0x10, ...varint(input), 0x18, ...varint(output),
+        0x20, ...varint(write), 0x28, ...varint(read), 0x48, ...varint(thinking),
+      ])))
+      const prior = billPrior
+        ? { input: 1800, read: 18_200, write: 300, output: 32, thinking: 8 }
+        : { input: 0, read: 0, write: 0, output: 32, thinking: 8 }
+
+      await withKit({}, async (kit) => {
+        const convDir = path.join(kit.home, ".gemini", "antigravity-cli", "conversations")
+        fs.mkdirSync(convDir, { recursive: true })
+        kit.prompts.push(async (agent) => {
+          const db = openSqlite(path.join(convDir, `${agent.sessionId}.db`))
+          try {
+            db.run("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            db.run("INSERT INTO gen_metadata VALUES (1, ?)", genBlob(prior))
+            db.run("INSERT INTO gen_metadata VALUES (2, ?)", genBlob({ input: 2100, read: 19_900, write: 400, output: 50, thinking: 10 }))
+          } finally {
+            db.close()
+          }
+          await agent.thought("reasoning across two calls")
+          await agent.text("done")
+          return {
+            stopReason: "end_turn",
+            usage: {
+              inputTokens: prior.input + 2100,
+              cachedReadTokens: prior.read + 19_900,
+              cachedWriteTokens: prior.write + 400,
+              outputTokens: 82,
+              thoughtTokens: 18,
+              totalTokens: prior.input + prior.read + prior.write + 22_482,
+            },
+          }
+        })
+        const { responses } = await runTurn(kit, baseBody({ tools: [] }), { stream })
+        assert.equal(responses.length, 1)
+        assert.equal(responses[0].stopReason, "end_turn")
+        const { magpie_deferred, ...windowUsage } = plain(responses[0].usage)
+        assert.deepEqual(windowUsage, {
+          input_tokens: 2100,
+          cache_read_input_tokens: 19_900,
+          cache_creation_input_tokens: 400,
+          output_tokens: 82,
+          output_tokens_details: { thinking_tokens: 18 },
+        })
+        assert.deepEqual(magpie_deferred, billPrior ? {
+          prompt_tokens: 20_300,
+          completion_tokens: 0,
+          cached_tokens: 18_200,
+          cache_write_tokens: 300,
+        } : undefined)
+      })
+    })
+  }
+}
+
 test("单次生成串行派发多工具 + WAL 关库：续接工具不虚增账单、不清空游标，后续步完整读取真实高命中率", { skip: !openSqlite }, async () => {
   const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n = Math.floor(n / 128) } out.push(n); return out }
   const field = (n, bytes) => [n * 8 + 2, ...varint(bytes.length), ...bytes]
@@ -1598,7 +1659,7 @@ test("异步延迟 >75ms 落盘：pending 预写行等待真实落盘；无预�
 
   // 子场景 2：无 pre-send 行且无文本块，第 2 步的整行在 150ms（>75ms）后才首次落盘：
   // 钉死行为：第 2 步按 75ms 超时先结 0；第 3 步看到 [Gen 2, Gen 3] 两笔调用时，
-  // 必须只报最新一笔调用的上下文窗口（严禁累加翻倍），并合并两笔的 output_tokens。
+  // 上下文窗口只报最新一笔，前一笔输入/缓存单列为 magpie_deferred，并合并两笔的 output_tokens。
   await withKit({}, async (kit) => {
     const convDir = path.join(kit.home, ".gemini", "antigravity-cli", "conversations")
     fs.mkdirSync(convDir, { recursive: true })
@@ -1644,7 +1705,11 @@ test("异步延迟 >75ms 落盘：pending 预写行等待真实落盘；无预�
       assert.deepEqual(plain(responses.map((r) => r.usage)), [
         { input_tokens: 1800, cache_read_input_tokens: 18_200, cache_creation_input_tokens: 0, output_tokens: 32, output_tokens_details: { thinking_tokens: 8 } },
         { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 },
-        { input_tokens: 2355, cache_read_input_tokens: 83_803, cache_creation_input_tokens: 0, output_tokens: 553, output_tokens_details: { thinking_tokens: 15 } },
+        {
+          input_tokens: 2355, cache_read_input_tokens: 83_803, cache_creation_input_tokens: 0,
+          output_tokens: 553, output_tokens_details: { thinking_tokens: 15 },
+          magpie_deferred: { prompt_tokens: 85_852, completion_tokens: 0, cached_tokens: 83_270, cache_write_tokens: 0 },
+        },
       ])
     } finally {
       clearTimeout(lateTimer)
