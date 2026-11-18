@@ -3192,16 +3192,19 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
   const count = (m, k) => m.set(k, (m.get(k) ?? 0) + 1)
   const empty = (how) => ({ error: { status: 502, message: "an empty reply" + emptyWhy(how, seen, ended ? usage : null) } })
   let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
-  // counted: the step's usage is the dashboard's events, its own counted
-  // with it or by a later step (ledger), never guessed
+  const stepUsages = new Map()
+  // counted: Cursor measured this Run, or the dashboard ledger owes it.
   let counted = false
-  // finish is the step's end, with what earlier steps owed (more), which
-  // is no reason not to guess the step's own. The step's usage is its own
-  // Run's alone: a client reads its prompt_tokens as how full the context
-  // is (pi, OpenCode), and an earlier step's prompt added to it read twice
-  // the context. What earlier steps owed goes apart, as magpie_deferred,
-  // which magpie counts with the step and no client reads.
-  const finish = (more) => {
+  // decision: defer earlier calls on tool handoff; not add them to
+  // prompt_tokens because clients read it as the last context window.
+  const finish = (owed) => {
+    // TurnEnded already counts every call. Only a Run cut before it needs
+    // the earlier measurements, in addition to any debt from older Runs.
+    let more = null
+    if (!ended) for (const measured of stepUsages.values()) {
+      if (measured !== usage) more = addUsage(more, measured)
+    }
+    more = addUsage(more, owed)
     if (!counted && !usage.output) usage.output = Math.floor((said + 3) / 4)
     // a guess only when Cursor counted nothing: a prompt read whole from
     // the cache leaves no uncached rest, and is no reason to guess; nor is
@@ -3337,12 +3340,18 @@ async function* decode(stream, { send, blobs, tools, estimate, close, stepUsage,
                     return
                   }
                   break
-                case 31: // model_call_completed: the step's own token usage
+                case 31: { // model_call_completed: the step's own token usage
                   if (!ended && uf.some((f) => f.num >= 2 && f.num <= 6)) {
-                    usage = usageOf(uf, 1)
+                    const id = pbStr(uf, 1) || Symbol()
+                    const prior = stepUsages.get(id)
+                    const measured = usageOf(uf, 1)
+                    // A repeated older call updates its count, not the window.
+                    if (!prior || prior === usage) usage = measured
+                    stepUsages.set(id, measured)
                     counted = true
                   }
                   break
+                }
                 case 2: // a call started on the client
                 case 3: // a call completed: by Cursor itself when it never started here
                 case 7: // a call the model is writing

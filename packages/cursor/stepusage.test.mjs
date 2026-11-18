@@ -78,6 +78,46 @@ test("a count Cursor gave, or none to be had, is as before", async () => {
   expect(out.at(-1).stop).toBe("stop")
 })
 
+const metered = (id, prompt, output, read, write, reasoning) =>
+  update(31, pb().str(1, id).varint(2, prompt).varint(3, output).varint(4, read).varint(5, write).varint(6, reasoning).done())
+const listTools = { data: pb().bytes(2, pb().bytes(36, Buffer.alloc(0))).done() }
+const firstCall = metered("mc-1", 950, 12, 900, 40, 5)
+const secondCall = metered("mc-2", 1371, 48, 1328, 20, 10)
+
+test("stateless tool handoff bills earlier calls without increasing the last context window", async () => {
+  const out = await run([firstCall, listTools, listed, secondCall, firstCall, call, listed], {
+    owedUsage: async () => ({ input: 10, output: 2, cacheRead: 15, cacheWrite: 5 }),
+  })
+  expect(out.filter((e) => e.tool).map((e) => e.tool.name)).toEqual(["cache_probe"])
+  expect(out.at(-1)).toEqual({
+    stop: "tool_calls",
+    usage: {
+      prompt_tokens: 1371,
+      completion_tokens: 48,
+      total_tokens: 1419,
+      prompt_tokens_details: { cached_tokens: 1328, cache_write_tokens: 20 },
+      completion_tokens_details: { reasoning_tokens: 10 },
+      magpie_deferred: { prompt_tokens: 980, completion_tokens: 14, cached_tokens: 915, cache_write_tokens: 45 },
+    },
+  })
+})
+
+test("stateless TurnEnded already includes the earlier metered calls", async () => {
+  const text = update(1, pb().str(1, "done").done())
+  const ended = update(14, pb().varint(1, 2321).varint(2, 60).varint(3, 2228).varint(4, 60).varint(5, 15).done())
+  const out = await run([firstCall, listTools, listed, secondCall, text, ended])
+  expect(out.at(-1)).toEqual({
+    stop: "stop",
+    usage: {
+      prompt_tokens: 2321,
+      completion_tokens: 60,
+      total_tokens: 2381,
+      prompt_tokens_details: { cached_tokens: 2228, cache_write_tokens: 60 },
+      completion_tokens_details: { reasoning_tokens: 15 },
+    },
+  })
+})
+
 test("stepUsage finds the Run's event by its conversation and time, once", async () => {
   Object.assign(STEP_WAIT, { first: 0, every: 10, until: 200 })
   const since = Date.now()

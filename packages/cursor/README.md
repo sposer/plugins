@@ -77,19 +77,20 @@ plugin's `fetch` answers them on Cursor's agent API:
   Cursor's `input_tokens` counts the cached prompt too: the cache
   read and written is taken out of it, and given as `cached_tokens` and
   `cache_write_tokens`, so it is counted once; its reasoning tokens are
-  `reasoning_tokens`. A step that calls tools gets no usage in its Run
-  (Cursor tells it only once the tools' results come back in the same
-  Run), so once the Run is closed its usage is read from the dashboard's
-  usage events, by the Run's conversation id: it shows in about 2.5 s,
-  and is looked for up to 6 s. Far from Cursor it shows later than that
-  (yetone/magpie#1053), so the step says 0 used and the conversation owes
-  it: its next steps collect the event in the background, and a step
-  that ends the turn waits for what is still owed, so the conversation
-  adds up to what Cursor counted. What a step collected of earlier steps
-  is not added to its own count, which a client reads as how full its
-  context is: it is `usage.magpie_deferred` (`prompt_tokens`,
-  `completion_tokens`, `cached_tokens`, `cache_write_tokens`), which
-  magpie bills with the step and clients ignore. An account
+  `reasoning_tokens`. A stateless Run that hands tools back to the caller
+  keeps its latest measured model call as the context window and reports
+  any earlier measured calls in `usage.magpie_deferred`. A finished turn
+  uses Cursor's whole-turn count without adding the step counts again.
+  When a stateless tool handoff has no usage from Cursor, the plugin reads
+  the dashboard's usage events after closing the Run, by its conversation
+  id: the event shows in about 2.5 s and is looked for up to 6 s. Far from
+  Cursor it shows later than that (yetone/magpie#1053), so the step says 0
+  used and the conversation owes it: its next steps collect the event in
+  the background, and the final step waits for what is still owed, so the
+  conversation adds up to what Cursor counted. That debt goes in the same
+  `usage.magpie_deferred` (`prompt_tokens`, `completion_tokens`,
+  `cached_tokens`, `cache_write_tokens`), which magpie bills with the step
+  and clients ignore. An account
   whose events miss the wait 3 steps in a row stops waiting for them.
   With nothing naming the session (so no later step to collect it), or
   an account that can't read its usage events, the step is estimated as
