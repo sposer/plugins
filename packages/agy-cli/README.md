@@ -268,6 +268,8 @@ agy 自己的系统提示词，只剩插件的一行工具说明和客户端的�
   violation of Terms of Service"，会按禁止重试的 403 语义 `permission_error` 返回，而不是
   当成正常正文。结尾是 "Verification Required"（Google 要求先验证这个账号）时也一样，
   并带上 agy 记下的验证链接；没有链接时说明去哪里验证。
+  结尾是 "User location is not supported for the API use." 时，保留地区拒绝原文，
+  按 `invalid_request_error` 结束本轮，非流式为 HTTP 400，不当成正常回复或账号封禁。
   结尾是 "⚠ Individual quota reached. … Resets in 1h18m40s."（这个账号自己的额度用完）时，
   按额度不足（`rate_limit_error`，非流式为 HTTP 429）结束本轮，原文和重置时间一并带上，
   magpie 据此让这个账号歇到重置，并改问下一个账号。

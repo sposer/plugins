@@ -120,6 +120,8 @@ const PING_INTERVAL_MS = 15_000
 const STEP_USAGE_WAIT_MS = 1_000
 const STEP_USAGE_SAME_GEN_WAIT_MS = 75
 const STEP_USAGE_POLL_MS = 25
+const REGION_DETAIL = "FAILED_PRECONDITION (code 400): User location is not supported for the API use."
+const REGION_CORE = `⚠ ${REGION_DETAIL}`
 // agy reports an upstream failure as an ordinary message chunk followed by end_turn.
 // 1.5.8 words a connection that failed every retry, and a spent credit
 // balance, on their own (#1136). 1.5.9 ends a turn whose every retry got 429
@@ -134,6 +136,7 @@ const AGENT_ERROR_MARKERS = [
   // (CustomUserErrorMessageFromHTTPError): the account must be verified
   // first. Answered as text, it was the whole reply (kidgpt on X, 11-16).
   "\n⚠ Verification Required\n",
+  `\n${REGION_CORE}\n`,
 ]
 const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
 // agy's ending for an account whose own quota is used up, with Google's
@@ -1760,6 +1763,7 @@ class Turn {
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
       if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) || QUOTA_MARKER.startsWith(tail) ||
+        (!this.textTail && keep === text.length && REGION_CORE.startsWith(tail)) ||
         (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail) ||
           CAP_MARKER.startsWith(tail)))) {
         this.heldText = tail
@@ -2633,6 +2637,11 @@ class Proc {
 
   async #agentError(turn) {
     const core = turn.agentErrorCore
+    if (core === REGION_CORE) {
+      // decision: keep the terminal 400 and its wording; not a 403 account
+      // refusal because Magpie routes this as a restriction on the request's origin.
+      return new AgentTurnError(`agy bridge: ${REGION_DETAIL}`, "invalid_request_error")
+    }
     if (core === QUOTA_CORE) {
       // Google's own words, the reset with them: magpie rests the account
       // until then and asks the next one

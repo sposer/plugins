@@ -1107,6 +1107,46 @@ test("#1136, #1151: agy's network, credit and 429 endings fail the turn", async 
   }
 })
 
+// agy 1.5.15 sends Google's region refusal as text before end_turn.
+const REGION = "\n⚠ FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n"
+
+test("agy's region refusal ends the stream as a 400 error without sending the warning as text", async () => {
+  await withKit({}, async (kit) => {
+    markerAgent(kit, ["Let me look", REGION.slice(0, 25), REGION.slice(25)])
+    const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "region-sse" },
+      messages: [{ role: "user", content: "hello" }] })))
+    assert.equal(replyText(parsed), "Let me look")
+    assert.equal(parsed.error?.type, "invalid_request_error")
+    assert.equal(parsed.error.status, 400)
+    assert.match(parsed.error.message, /User location is not supported for the API use/)
+    assert.ok(!parsed.events.some(({ event }) => event === "message_stop"))
+  })
+})
+
+test("agy's region refusal as the entire reply fails a non-stream request as HTTP 400", async () => {
+  await withKit({}, async (kit) => {
+    markerAgent(kit, [REGION.slice(0, 25).trimStart(), REGION.slice(25)])
+    const response = await kit.request(baseBody({ metadata: { user_id: "region-json" },
+      messages: [{ role: "user", content: "hello" }], stream: false }))
+    const body = await response.json()
+    assert.equal(response.status, 400)
+    assert.equal(body.error.type, "invalid_request_error")
+    assert.match(body.error.message, /User location is not supported for the API use/)
+  })
+})
+
+test("the model quoting agy's region refusal with more text after keeps it", async () => {
+  const chunks = ["agy said" + REGION.slice(0, 25), REGION.slice(25), "That line comes from agy."]
+  await withKit({}, async (kit) => {
+    markerAgent(kit, chunks)
+    const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "region-quoted" },
+      messages: [{ role: "user", content: "what did agy print?" }] })))
+    assert.equal(parsed.error, null)
+    assert.equal(parsed.stopReason, "end_turn")
+    assert.equal(replyText(parsed), chunks.join(""))
+  })
+})
+
 // #1201: agy 1.5.9 passes a banned account's Google 403 through as the reply.
 const BANNED = "\n⚠ PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n"
 

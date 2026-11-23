@@ -377,6 +377,9 @@ off unless you turn it on.
   `permission_error` with 403 semantics, not as normal reply text. So is the
   "Verification Required" ending (Google wants the account verified), with
   the link to verify it at when agy logged one, else where to verify it.
+  The "User location is not supported for the API use." ending keeps Google's
+  wording and returns an `invalid_request_error` (HTTP 400 without streaming),
+  not reply text or an account ban.
   The "⚠ Individual quota reached. … Resets in 1h18m40s." ending (the
   account's own quota is used up) ends the turn as a rate limit
   (`rate_limit_error`, HTTP 429 without streaming) carrying agy's words and
