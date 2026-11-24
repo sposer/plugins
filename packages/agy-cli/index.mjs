@@ -2796,6 +2796,7 @@ class Proc {
       ready: true,
       socket,
       result: null,
+      rawResult: null,
       deferred: false,
       lateDelivered: false,
       deadline: null,
@@ -2881,14 +2882,19 @@ class Proc {
     turn.notifyLate()
   }
 
+  // decision: validate duplicate results against call.rawResult rather than the
+  // MCP-augmented call.result; not deferring validation until after
+  // inspectToolTurn or history_mismatch because retry notices/companions may
+  // change across reconnects or compaction while truly conflicting duplicate
+  // tool_results must still return 409 before dropping the pending turn.
   validateResults(results) {
     const unique = new Map()
     for (const item of results) {
       const id = item.block.tool_use_id
-      const serialized = JSON.stringify(item.result)
+      const serialized = JSON.stringify(item.rawResult ?? item.result)
       const previous = unique.get(id)
-      if ((previous && JSON.stringify(previous.result) !== serialized) ||
-        (item.call.result && JSON.stringify(item.call.result) !== serialized)) {
+      if ((previous && JSON.stringify(previous.rawResult ?? previous.result) !== serialized) ||
+        (item.call.result && JSON.stringify(item.call.rawResult ?? item.call.result) !== serialized)) {
         const error = new Error(`agy bridge: conflicting duplicate result for ${id}`)
         error.statusCode = 409
         throw error
@@ -2902,17 +2908,19 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
     turn.touchClient()
-    for (const { call, result } of this.validateResults(results).values()) {
+    for (const { call, result, rawResult } of this.validateResults(results).values()) {
       clearTimeout(call.deadline)
       if (call.deferred) {
         if (!call.result) {
           call.result = result
+          call.rawResult = rawResult ?? result
           this.#deliverLate(turn, call)
         }
         continue
       }
       if (call.mcpResponded || !call.ready || turn.done) continue
       call.result = result
+      call.rawResult = rawResult ?? result
       this.#respondMcp(call, { result })
     }
     turn.arm()
@@ -7080,11 +7088,15 @@ export const AntigravityBridgePlugin = async () => {
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
                   if (turn.steering) throw new BusyError("agy bridge: this conversation is already steering this tool turn")
                   noProgressRepeats.delete(convKey) // matched results are real progress
-                  const rawResults = matches.map(({ block, match }) => ({
-                    block,
-                    call: match.call,
-                    result: toolResult(block),
-                  }))
+                  const rawResults = matches.map(({ block, match }) => {
+                    const result = toolResult(block)
+                    return {
+                      block,
+                      call: match.call,
+                      result,
+                      rawResult: result,
+                    }
+                  })
                   proc.validateResults(rawResults)
                   let interrupted = isInterruptedToolTurn(body)
                   let results = rawResults
@@ -7101,7 +7113,6 @@ export const AntigravityBridgePlugin = async () => {
                       }
                     }
                   }
-                  if (!interrupted) proc.validateResults(results)
                   // An image over MCP reaches agy's model as a path it can't
                   // read, so a result with one takes the steer's way: the call
                   // gets the text, the next prompt the image.

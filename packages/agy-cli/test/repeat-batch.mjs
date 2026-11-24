@@ -1884,3 +1884,152 @@ test("fetchInput Request headers preserve x-magpie-session isolation", async () 
     assert.equal(kit.acpSpawns.length, 2)
   })
 })
+
+test("retrying a live tool_result turn with a trailing system-reminder replays instead of returning 409", async () => {
+  const stderr = captureStderr()
+  try {
+    await withKit({}, async (kit) => {
+      const mcpReceived = []
+      kit.defaultPrompt = async (agent) => {
+        const text = promptText({ prompt: agent.prompt })
+        if (text.includes("SKILL_BODY_MARKER")) {
+          await agent.text("replayed after disconnect")
+          return { stopReason: "end_turn" }
+        }
+        const firstResult = await agent.tool("Read", { path: "/a" })
+        mcpReceived.push((firstResult?.result?.content || []).map((part) => part.text || "").join("\n"))
+        await agent.tool("Read", { path: "/b" })
+        await agent.text("live done")
+        return { stopReason: "end_turn" }
+      }
+      const opening = baseBody({
+        metadata: { user_id: "retry-system-reminder" },
+        messages: [{ role: "user", content: "TWOSTEP skill reminder" }],
+      })
+      const turn1 = await readSse(await kit.request(opening))
+      assert.equal(turn1.stopReason, "tool_use")
+
+      const baseStep2 = continueWithToolResults(opening, turn1, () => "Workflow instruction state updated: Skill frontend-design")
+      const step2Body = {
+        ...baseStep2,
+        messages: [
+          ...baseStep2.messages,
+          { role: "user", content: "<system-reminder>\nSKILL_BODY_MARKER\n</system-reminder>" },
+        ],
+      }
+      const turn2 = await readSse(await kit.request(step2Body))
+      assert.equal(turn2.stopReason, "tool_use")
+      assert.equal(mcpReceived.length, 1)
+      assert.ok(mcpReceived[0].includes("Workflow instruction state updated: Skill frontend-design"))
+      assert.ok(mcpReceived[0].includes("SKILL_BODY_MARKER"))
+
+      // Client disconnects before receiving turn2 and retries step2Body verbatim.
+      const retryRes = await kit.request(step2Body)
+      assert.equal(retryRes.status, 200, "exact retry with trailing system-reminder must replay, not 409")
+      const retryParsed = await readSse(retryRes)
+      assert.equal(retryParsed.stopReason, "end_turn")
+      assert.ok(retryParsed.content.some((block) => block.text?.includes("replayed after disconnect")))
+      assert.equal(kit.acpSpawns.length, 2)
+      assert.ok(prompts(kit).at(-1)?.includes("SKILL_BODY_MARKER"))
+    })
+  } finally {
+    stderr.restore()
+  }
+  assert.ok(stderr.lines.some((row) => row.action === "drop_live" && row.reason === "history_mismatch"))
+})
+
+test("retrying with same raw tool_result and changed or dropped system-reminder replays cleanly", async () => {
+  await withKit({}, async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      const text = promptText({ prompt: agent.prompt })
+      if (text.includes("REMINDER_V2")) {
+        await agent.text("replayed with updated reminder")
+        return { stopReason: "end_turn" }
+      }
+      await agent.tool("Read", { path: "/a" })
+      await agent.tool("Read", { path: "/b" })
+      await agent.text("live done")
+      return { stopReason: "end_turn" }
+    }
+    const opening = baseBody({
+      metadata: { user_id: "retry-changed-reminder" },
+      messages: [{ role: "user", content: "TWOSTEP changed reminder" }],
+    })
+    const turn1 = await readSse(await kit.request(opening))
+    assert.equal(turn1.stopReason, "tool_use")
+
+    const baseStep2 = continueWithToolResults(opening, turn1, () => "step-one")
+    const firstAttempt = {
+      ...baseStep2,
+      messages: [
+        ...baseStep2.messages,
+        { role: "user", content: "<system-reminder>\nREMINDER_V1\n</system-reminder>" },
+      ],
+    }
+    const turn2 = await readSse(await kit.request(firstAttempt))
+    assert.equal(turn2.stopReason, "tool_use")
+
+    const secondAttempt = {
+      ...baseStep2,
+      messages: [
+        ...baseStep2.messages,
+        { role: "user", content: "<system-reminder>\nREMINDER_V2\n</system-reminder>" },
+      ],
+    }
+    const retryRes = await kit.request(secondAttempt)
+    assert.equal(retryRes.status, 200, "same raw tool_result with changed reminder must replay, not 409")
+    const retryParsed = await readSse(retryRes)
+    assert.equal(retryParsed.stopReason, "end_turn")
+    assert.ok(retryParsed.content.some((block) => block.text?.includes("replayed with updated reminder")))
+    assert.equal(kit.acpSpawns.length, 2)
+  })
+})
+
+test("conflicting duplicate tool_result still returns 409 after notice augmentation without dropping pending turn", async () => {
+  await withKit({}, async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      await agent.tool("Read", { path: "/a" })
+      const second = await agent.tool("Read", { path: "/b" })
+      const secondText = (second?.result?.content || []).map((part) => part.text || "").join("\n")
+      await agent.text(`live finished:${secondText}`)
+      return { stopReason: "end_turn" }
+    }
+    const opening = baseBody({
+      metadata: { user_id: "conflict-after-reminder" },
+      messages: [{ role: "user", content: "TWOSTEP conflict check" }],
+    })
+    const turn1 = await readSse(await kit.request(opening))
+    assert.equal(turn1.stopReason, "tool_use")
+
+    const baseStep2 = continueWithToolResults(opening, turn1, () => "step-one")
+    const step2Body = {
+      ...baseStep2,
+      messages: [
+        ...baseStep2.messages,
+        { role: "user", content: "<system-reminder>\nREMINDER_V1\n</system-reminder>" },
+      ],
+    }
+    const turn2 = await readSse(await kit.request(step2Body))
+    assert.equal(turn2.stopReason, "tool_use")
+
+    const conflictingBase = continueWithToolResults(opening, turn1, () => "conflicting-step-one")
+    const conflictingBody = {
+      ...conflictingBase,
+      messages: [
+        ...conflictingBase.messages,
+        { role: "user", content: "<system-reminder>\nREMINDER_V1\n</system-reminder>" },
+      ],
+    }
+    const conflict = await errorOf(await kit.request(conflictingBody))
+    assert.equal(conflict.status, 409)
+    assert.match(conflict.body?.error?.message || "", /conflicting duplicate result/)
+    assert.equal(kit.acpSpawns.length, 1)
+
+    const step3Res = await kit.request(continueWithToolResults(step2Body, turn2, () => "step-two"))
+    assert.equal(step3Res.status, 200)
+    const step3 = await readSse(step3Res)
+    assert.equal(step3.stopReason, "end_turn")
+    assert.ok(step3.content.some((block) => block.text?.includes("live finished:step-two")))
+    assert.equal(kit.acpSpawns.length, 1)
+  })
+})
