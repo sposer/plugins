@@ -380,6 +380,9 @@ off unless you turn it on.
   The "User location is not supported for the API use." ending keeps Google's
   wording and returns an `invalid_request_error` (HTTP 400 without streaming),
   not reply text or an account ban.
+  Google's `UNAUTHENTICATED (code 401)` notice about invalid credentials ends
+  the stream with `authentication_error` instead of reply text, or returns
+  HTTP 401 without streaming. Sign in again with the affected account.
   The "⚠ Individual quota reached. … Resets in 1h18m40s." ending (the
   account's own quota is used up) ends the turn as a rate limit
   (`rate_limit_error`, HTTP 429 without streaming) carrying agy's words and

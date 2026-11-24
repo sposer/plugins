@@ -321,7 +321,7 @@ class FakeAgy {
       await tick()
       this.respond(id, result ?? { stopReason: "end_turn" })
     } catch (error) {
-      this.send({ id, error: { code: -32603, message: String(error?.message ?? error) } })
+      this.send({ id, error: error?.acpError ?? { code: -32603, message: String(error?.message ?? error) } })
     }
   }
 

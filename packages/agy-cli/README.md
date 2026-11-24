@@ -270,6 +270,8 @@ agy 自己的系统提示词，只剩插件的一行工具说明和客户端的�
   并带上 agy 记下的验证链接；没有链接时说明去哪里验证。
   结尾是 "User location is not supported for the API use." 时，保留地区拒绝原文，
   按 `invalid_request_error` 结束本轮，非流式为 HTTP 400，不当成正常回复或账号封禁。
+  Google 的 `UNAUTHENTICATED (code 401)` 凭据错误提示也不写入正文：流式以
+  `authentication_error` 结束，非流式返回 HTTP 401。请重新登录报错的账号。
   结尾是 "⚠ Individual quota reached. … Resets in 1h18m40s."（这个账号自己的额度用完）时，
   按额度不足（`rate_limit_error`，非流式为 HTTP 429）结束本轮，原文和重置时间一并带上，
   magpie 据此让这个账号歇到重置，并改问下一个账号。

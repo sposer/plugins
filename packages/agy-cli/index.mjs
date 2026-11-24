@@ -122,6 +122,9 @@ const STEP_USAGE_SAME_GEN_WAIT_MS = 75
 const STEP_USAGE_POLL_MS = 25
 const REGION_DETAIL = "FAILED_PRECONDITION (code 400): User location is not supported for the API use."
 const REGION_CORE = `⚠ ${REGION_DETAIL}`
+const ACP_AUTH_REQUIRED = -32000 // ACP v1 JSON-RPC: Authentication required.
+const AUTH_MARKER = "⚠ UNAUTHENTICATED (code 401)"
+const AUTH_NOTICE_MAX = 1024
 // agy reports an upstream failure as an ordinary message chunk followed by end_turn.
 // 1.5.8 words a connection that failed every retry, and a spent credit
 // balance, on their own (#1136). 1.5.9 ends a turn whose every retry got 429
@@ -1187,9 +1190,10 @@ class UnsupportedContent extends Error {
 // without it the client got a 429 and retried a request that can't pass
 // every minute (plugins#1151).
 export function streamErrorOf(error) {
-  const type = error?.kind || "api_error"
+  const type = error?.acpError?.code === ACP_AUTH_REQUIRED ? "authentication_error" : error?.kind || "api_error"
   const out = { type, message: String(error?.message ?? error) }
   if (type === "invalid_request_error") out.status = 400
+  if (type === "authentication_error") out.status = 401
   // Google refused the account (refusedError): its status, so magpie
   // reads it as the account's refusal, not as a failed reply.
   if (type === "permission_error") out.status = 403
@@ -1754,6 +1758,12 @@ class Turn {
         return
       }
     }
+    const auth = this.authEnding(text)
+    if (auth) {
+      this.heldText = text.slice(auth.start)
+      this.emitText(text.slice(0, auth.start))
+      return
+    }
     const quota = this.quotaEnding(text)
     if (quota >= 0) {
       this.heldText = text.slice(quota)
@@ -1772,6 +1782,28 @@ class Turn {
       }
     }
     this.emitText(text)
+  }
+
+  // decision: use the terminal status marker when ACP sends no structured error;
+  // not search arbitrary reply text because the model may be quoting a 401.
+  // Revisit when agy stops sending these errors as message chunks.
+  authEnding(text, final = false) {
+    const offset = Math.max(0, text.length - AUTH_NOTICE_MAX - 2) // leave room for CRLF
+    const tail = text.slice(offset)
+    if (!tail.includes("⚠")) return null
+    for (const line of tail.matchAll(/(^|\r?\n)[ \t]*(?=⚠)/g)) {
+      if (!line[1] && (offset || (this.textTail !== "" && this.textTail !== "\n"))) continue
+      const notice = tail.slice(line.index + line[0].length).trimEnd()
+      if (notice.length > AUTH_NOTICE_MAX) continue
+      const start = offset + line.index
+      if (!final && AUTH_MARKER.startsWith(notice)) return { start, notice }
+      if (notice === AUTH_MARKER) return { start, notice }
+      if (!notice.startsWith(`${AUTH_MARKER}:`)) continue
+      // Indented wraps belong to the detail, but a new paragraph or a closing
+      // Markdown fence means the model was quoting the warning.
+      if (!/\n(?![ \t]+(?!`{3}|~{3})\S)/.test(notice)) return { start, notice }
+    }
+    return null
   }
 
   // Where agy's quota ending (QUOTA_CORE) starts in text, with the newline
@@ -1857,8 +1889,10 @@ class Turn {
 
   // The prompt ended: a marker still held was agy's own.
   endText() {
-    const core = AGENT_ERROR_CORES.find((core) => this.heldText.includes(core))
+    const auth = this.authEnding(this.heldText, true)
+    const core = auth ? AUTH_MARKER : AGENT_ERROR_CORES.find((core) => this.heldText.includes(core))
     if (core) {
+      if (auth) this.authNotice = auth.notice.slice("⚠ ".length)
       this.agentError = true
       this.agentErrorCore = core
       this.heldText = ""
@@ -2637,6 +2671,9 @@ class Proc {
 
   async #agentError(turn) {
     const core = turn.agentErrorCore
+    if (core === AUTH_MARKER) {
+      return new AgentTurnError(`agy bridge: ${turn.authNotice}`, "authentication_error")
+    }
     if (core === REGION_CORE) {
       // decision: keep the terminal 400 and its wording; not a 403 account
       // refusal because Magpie routes this as a restriction on the request's origin.

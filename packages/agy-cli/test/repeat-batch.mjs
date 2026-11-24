@@ -1147,6 +1147,69 @@ test("the model quoting agy's region refusal with more text after keeps it", asy
   })
 })
 
+const UNAUTHENTICATED = "⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project."
+
+test("agy's terminal 401 uses the status marker, even when the detail changes", async () => {
+  await withKit({}, async (kit) => {
+    const detail = "The OAuth grant was revoked. Sign in again."
+    // Keep the real answer even when the warning (and its status) is split across chunks.
+    const answer = "Let me look. ".repeat(100).trimEnd()
+    markerAgent(kit, [answer + "\n  ⚠", " UNAUTHENTICATED (code 4", "01): " + detail + "\n"])
+    const parsed = await readSse(await kit.request(baseBody({ messages: [{ role: "user", content: "hello" }] })))
+    assert.equal(replyText(parsed), answer)
+    assert.equal(parsed.error?.type, "authentication_error")
+    assert.equal(parsed.error?.status, 401)
+    assert.equal(parsed.error.message, `agy bridge: UNAUTHENTICATED (code 401): ${detail}`)
+    assert.ok(!parsed.events.some(({ event }) => event === "message_stop"))
+  })
+})
+
+test("an ACP authentication error on session/prompt takes precedence over an in-band notice", async () => {
+  await withKit({}, async (kit) => {
+    const message = "Authentication required to continue this session"
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("Model output\n")
+      await agent.text(UNAUTHENTICATED)
+      throw Object.assign(new Error(message), { acpError: { code: -32000, message } })
+    }
+    const parsed = await readSse(await kit.request(baseBody({ messages: [{ role: "user", content: "hello" }] })))
+    assert.equal(replyText(parsed), "Model output")
+    assert.equal(parsed.error?.type, "authentication_error")
+    assert.equal(parsed.error?.status, 401)
+    assert.ok(parsed.error.message.endsWith(message))
+  })
+})
+
+test("agy's wrapped 401 banner makes a non-stream request fail as HTTP 401", async () => {
+  await withKit({}, async (kit) => {
+    const wrapped = UNAUTHENTICATED.replace("OAuth 2 access", "OAuth 2    \r\n  access").replace("See https:", "See\r\n  https:")
+    markerAgent(kit, ["⚠", wrapped.slice(1, 80), wrapped.slice(80)])
+    const response = await kit.request(baseBody({ stream: false, messages: [{ role: "user", content: "hello" }] }))
+    const body = await response.json()
+    assert.equal(response.status, 401)
+    assert.equal(body.error.type, "authentication_error")
+    assert.equal(body.error.message, `agy bridge: ${wrapped.slice(2)}`)
+    assert.equal(body.content, undefined)
+  })
+})
+
+test("the model can quote agy's 401 or write a similar warning without losing text", async () => {
+  for (const chunks of [
+    ["agy printed:\n```text\n", UNAUTHENTICATED, "\n```"],
+    ["agy printed:\n  ```text\n", "  " + UNAUTHENTICATED, "\n  ```"],
+    ["The error is ", UNAUTHENTICATED],
+    ["agy printed:\n", UNAUTHENTICATED, "\nHere is what it means."],
+    ["A related error:\n", "⚠ UNAUTHENTICATED (code 403): No session was found."],
+  ]) {
+    await withKit({}, async (kit) => {
+      markerAgent(kit, chunks)
+      const parsed = await readSse(await kit.request(baseBody({ messages: [{ role: "user", content: "quote the error" }] })))
+      assert.equal(parsed.error, null)
+      assert.equal(replyText(parsed), chunks.join(""))
+    })
+  }
+})
+
 // #1201: agy 1.5.9 passes a banned account's Google 403 through as the reply.
 const BANNED = "\n⚠ PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.\n"
 
