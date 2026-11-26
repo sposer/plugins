@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-agy-cli-auth",
-  "version": "0.1.98",
+  "version": "0.1.99",
   "description": "Magpie/OpenCode model provider that runs the local Antigravity CLI in its native interactive terminal on Linux",
   "type": "module",
   "main": "./opencode.mjs",
