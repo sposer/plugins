@@ -27,7 +27,15 @@ const PROVIDER_ID = "agy-cli"
 function maxProcs() {
   return positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
 }
+// Longest time a native turn may go without a new transcript row, excluding
+// time spent waiting for a client tool result.
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
+// Longest time a native turn waits for one client tool result.
+const TOOL_TIMEOUT_MS = 30 * 60 * 1000
+// Under slot pressure, a turn whose client has held a tool call this long gives up its slot.
+const EVICT_WAIT_MS = 30_000
+// A tool_use response waits this long for the transcript row of its planner step.
+const USAGE_SYNC_MS = 1000
 const NO_RETRY_HEADERS = { "x-should-retry": "false" }
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
@@ -2141,39 +2149,6 @@ function inspectToolTurn(results, body) {
   return { results: finalResults, userSteered }
 }
 
-function withContextNotices(results, body) {
-  return inspectToolTurn(results, body).results
-}
-
-// When a previous tool-result HTTP request failed or was aborted before producing
-// an assistant message, and the user subsequently enters a new standalone user
-// message after the tool_result message, replay in a fresh session instead of
-// wedging the conversation with HTTP 400.
-function canReplayFollowUpAfterResults(body, rawResults) {
-  const { history, messages } = trailingMessages(body)
-  let lastResultIndex = -1
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i]
-    if (message.role === "user" && Array.isArray(message.content) &&
-      message.content.some((block) => block?.type === "tool_result")) {
-      lastResultIndex = i
-    }
-  }
-  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
-  const tail = messages.slice(lastResultIndex + 1)
-  if (!tail.some((message) => message.role === "user")) return false
-  try {
-    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
-  } catch {
-    return false
-  }
-  for (const message of tail) {
-    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
-    if (UNCLOSED_NOTICE_RE.test(rest)) return false
-  }
-  return true
-}
-
 function namedWorkDirectory(body, init) {
   const raw = new Headers(init.headers || {}).get("x-magpie-work-dir")
   if (raw) {
@@ -2265,6 +2240,40 @@ function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
+// Bounded, content-free stderr rows: never prompts, arguments, results or tool IDs.
+const EVENT_WINDOW_MS = 60_000
+const EVENT_MAX_PER_WINDOW = 30
+const events = { windowStart: 0, count: 0, suppressed: 0 }
+
+function logBridgeEvent(action, fields) {
+  if (process.env.AGY_BRIDGE_EVENTS === "0") return
+  const now = Date.now()
+  if (now - events.windowStart >= EVENT_WINDOW_MS) {
+    events.windowStart = now
+    events.count = 0
+  }
+  if (events.count >= EVENT_MAX_PER_WINDOW) {
+    events.suppressed++
+    return
+  }
+  events.count++
+  const row = { event: "agy_bridge_tui", ts: now, action, ...fields }
+  if (events.suppressed) {
+    row.suppressed = events.suppressed
+    events.suppressed = 0
+  }
+  try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
+}
+
+// Exposed calls of turns that ended before the client returned their result,
+// so the replay that serves the result can say why. Bounded; entries are read once.
+const endedCalls = new Map()
+const ENDED_CALLS_MAX = 64
+
+function zeroUsage() {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, steps: 0, toolCalls: 0 }
+}
+
 // One native turn can outlive several HTTP responses. Its MCP callback blocks
 // until the client next attaches and returns the corresponding result.
 class TuiTurn {
@@ -2272,13 +2281,30 @@ class TuiTurn {
     this.tools = tools
     this.workDir = workDir
     this.token = randomBytes(24).toString("hex")
+    this.id = randomBytes(4).toString("hex")
     this.identity = identity
     this.instructions = systemText(body)
     this.selection = selection
     this.abort = new AbortController()
     this.events = []
+    this.waiter = null
+    this.reading = false
     this.sockets = new Set()
     this.pending = null
+    this.callIds = new Set()
+    this.calls = 0
+    this.startedAt = Date.now()
+    this.phases = {}
+    this.usage = zeroUsage()
+    this.reported = zeroUsage()
+    this.usageWaiters = new Set()
+  }
+
+  // Ends the native turn once; the first reason is the one reported.
+  end(reason) {
+    if (this.abort.signal.aborted) return
+    this.reason = reason
+    this.abort.abort()
   }
 
   listTools() {
@@ -2296,9 +2322,60 @@ class TuiTurn {
     const block = { type: "tool_use", id: `toolu_${randomBytes(12).toString("hex")}`, name, input }
     this.sockets.add(socket)
     socket.once("close", () => {
-      if (this.sockets.delete(socket)) this.abort.abort()
+      if (this.sockets.delete(socket)) this.end("mcp_closed")
     })
-    this.push({ call: { name, block, socket } })
+    this.calls++
+    clearTimeout(this.toolTimer)
+    this.toolTimer = setTimeout(() => this.end("tool_timeout"),
+      configuredTimeout("AGY_BRIDGE_TOOL_TIMEOUT_MS", TOOL_TIMEOUT_MS))
+    this.toolTimer.unref?.()
+    this.push({ call: { name, block, socket, ordinal: this.calls } })
+  }
+
+  // AGY is blocked on a client tool call while the bridge holds its MCP request.
+  waiting() {
+    return this.sockets.size > 0
+  }
+
+  // How long the client has held the pending call with no request reading
+  // this turn, or -1.
+  detachedFor(now) {
+    return this.pending && !this.busy() ? now - this.exposedAt : -1
+  }
+
+  progress(usage) {
+    this.usage = usage
+    for (const waiter of this.usageWaiters) waiter()
+  }
+
+  // AGY writes a planner row before it sends that row's calls to MCP, but the
+  // transcript is polled. Wait briefly so a tool_use response carries its step.
+  async usageThrough(ordinal) {
+    // Rows are followed only once the transcript shows the submitted turn.
+    if (this.usage.toolCalls >= ordinal || this.phases.submitted_ms === undefined) return
+    let done
+    const reached = new Promise(resolve => { done = resolve })
+    const waiter = () => { if (this.usage.toolCalls >= ordinal) done() }
+    const timer = setTimeout(done, USAGE_SYNC_MS)
+    this.usageWaiters.add(waiter)
+    this.abort.signal.addEventListener("abort", done, { once: true })
+    try { await reached } finally {
+      clearTimeout(timer)
+      this.usageWaiters.delete(waiter)
+      this.abort.signal.removeEventListener("abort", done)
+    }
+  }
+
+  // decision: report the tokens of the native steps since the previous
+  // response; not the last step's tokens because a response can follow several
+  // steps and every step is billed. A response with no new step reports zero.
+  takeUsage(totals = this.usage) {
+    const delta = {}
+    for (const key of ["inputTokens", "outputTokens", "cacheReadTokens"]) {
+      delta[key] = Math.max(0, tokenCount(totals[key]) - this.reported[key])
+      this.reported[key] += delta[key]
+    }
+    return delta
   }
 
   push(event) {
@@ -2311,32 +2388,70 @@ class TuiTurn {
     }
   }
 
-  start(agy, options) {
+  start(agy, options, cause) {
     tuiTurns.add(this)
+    logBridgeEvent("turn_start", { turn: this.id, tools: this.tools.length, images: options.parts ? options.parts.length - 1 : 0,
+      ...(cause ? { replay: cause } : {}) })
     this.closed = (async () => {
       let event
       try {
         const mcp = this.tools.length ? { tools: this.tools, port: await ensureControlServer(), token: this.token } : undefined
         if (mcp) sessions.set(this.token, this)
-        event = { result: await runTui(agy, { ...options, signal: this.abort.signal, mcp }) }
+        event = { result: await runTui(agy, { ...options, signal: this.abort.signal, mcp, observer: {
+          waiting: () => this.waiting(),
+          progress: usage => this.progress(usage),
+          phase: name => { this.phases[`${name}_ms`] = Date.now() - this.startedAt },
+        } }) }
       } catch (error) {
-        event = { error }
+        event = { error: this.endError(error) }
       } finally {
         sessions.delete(this.token)
-        this.unwatchSignal?.()
-        this.clearPending()
+        clearTimeout(this.toolTimer)
         for (const socket of this.sockets) socket.destroy()
         this.sockets.clear()
         tuiTurns.delete(this)
-        this.events.length = 0
-        this.push(event)
+        this.finish(event)
       }
     })()
   }
 
-  next(signal) {
+  // A turn the bridge ended reports why, not the cancellation it caused.
+  endError(error) {
+    if (error?.statusCode !== 499) return error
+    const ended = {
+      tool_timeout: ["the client did not return the tool result in time", 504],
+      mcp_closed: ["the native TUI closed its tool call", 502],
+      evicted: ["the native TUI turn gave up its slot while waiting for a tool result", 503],
+    }[this.reason]
+    return ended ? Object.assign(new Error(`agy bridge: ${ended[0]}`), { statusCode: ended[1], phase: error.phase }) : error
+  }
+
+  // decision: give the end of a turn to the request still reading it; not
+  // queue it for a request that may never come because a client holding a
+  // tool call returns the result later, which then replays the history.
+  finish(event) {
+    const { error } = event
+    const status = error ? error.statusCode ?? 502 : 200
+    const pending = this.pending
+    this.ended = event
+    for (const id of this.callIds) tuiCalls.delete(id)
+    this.pending = null
     this.unwatchSignal?.()
-    const cancel = () => this.abort.abort()
+    const reason = this.reason ?? (error ? "failed" : "completed")
+    logBridgeEvent("turn_end", { turn: this.id, reason, status, ...(error?.phase ? { phase: error.phase } : {}),
+      ms: Date.now() - this.startedAt, calls: this.calls, steps: this.usage.steps, ...this.phases,
+      ...(error?.detail ? { pty: error.detail } : {}), ...(this.reading ? {} : { unread: true }) })
+    // An exposed call's result still comes back later, whether or not its response is still being built.
+    if (pending) rememberEndedCall(pending.block.id, `${reason}:${status}`)
+    if (!this.waiter) return
+    this.events.length = 0
+    this.push(event)
+  }
+
+  next(signal) {
+    this.reading = true
+    this.unwatchSignal?.()
+    const cancel = () => this.end("client_cancelled")
     if (signal?.aborted) cancel()
     else if (signal) {
       signal.addEventListener("abort", cancel, { once: true })
@@ -2345,25 +2460,33 @@ class TuiTurn {
     return this.events.length ? Promise.resolve(this.events.shift()) : new Promise(resolve => { this.waiter = resolve })
   }
 
+  // A request is reading this turn, from next() until its response is built.
+  busy() {
+    return this.reading === true
+  }
+
+  sameIdentity(identity) {
+    return this.identity.home === identity.home && this.identity.scope === identity.scope
+  }
+
   expose(call, body, content) {
     const history = trailingMessages(body).history
     const tail = body.messages.slice(history.length)
     call.history = historyKey([...history, ...tail])
     call.assistant = historyKey(stripToolUseInputs([{ role: "assistant", content }]))
     this.pending = call
+    this.exposedAt = Date.now()
+    // Every call stays mapped to its turn until the turn ends, so a repeated
+    // result is recognized as this turn's rather than as a lost one.
+    this.callIds.add(call.block.id)
     tuiCalls.set(call.block.id, this)
-  }
-
-  clearPending() {
-    if (this.pending) tuiCalls.delete(this.pending.block.id)
-    this.pending = null
   }
 
   matchesPending(history, identity) {
     const call = this.pending
     const shown = lastAssistantCalls(history)
     if (this.abort.signal.aborted || !call || shown.length !== 1 || shown[0].id !== call.block.id ||
-      shown[0].name !== call.name || this.identity.home !== identity.home || this.identity.scope !== identity.scope) return false
+      shown[0].name !== call.name || !this.sameIdentity(identity)) return false
     let split = history.length
     while (split > 0 && history[split - 1].role === "assistant") split--
     // Claude Code can normalize the input of the matched client tool, such as Edit.replace_all.
@@ -2371,22 +2494,66 @@ class TuiTurn {
       call.assistant === historyKey(stripToolUseInputs(history.slice(split)))
   }
 
+  // Returns true once the result reaches the waiting MCP call. False means the
+  // request no longer continues this turn as shown and needs a new native turn.
   acceptResult(body, blocks, identity, tools, workDir, selection) {
     const call = this.pending
-    if (!this.matchesPending(trailingMessages(body).history, identity) || blocks.length !== 1 ||
-      call.block.id !== blocks[0].tool_use_id) {
-      throw Object.assign(new Error("agy bridge: tool results do not match the waiting native TUI turn"), { statusCode: 409 })
-    }
+    if (!call || blocks.length !== 1 || call.block.id !== blocks[0].tool_use_id ||
+      !this.matchesPending(trailingMessages(body).history, identity)) return false
     const { results, userSteered } = inspectToolTurn([{ block: blocks[0], call, result: toolResult(blocks[0]) }], body)
     // A changed catalog or a new instruction needs a new native turn, not an edit to an MCP result.
     if (userSteered || this.workDir !== workDir || this.selection.model !== selection.model ||
       this.selection.effort !== selection.effort || !sameInstructions(this.instructions, systemText(body)) ||
       stableJSON(this.tools) !== stableJSON(tools) || results.some(({ result }) => resultHasImage(result))) return false
-    this.clearPending()
+    this.pending = null
+    clearTimeout(this.toolTimer)
     this.sockets.delete(call.socket)
     call.socket.end(JSON.stringify({ result: results[0].result }) + "\n")
     return true
   }
+}
+
+function rememberEndedCall(id, why) {
+  endedCalls.delete(id)
+  endedCalls.set(id, why)
+  while (endedCalls.size > ENDED_CALLS_MAX) endedCalls.delete(endedCalls.keys().next().value)
+}
+
+function takeEndedCall(id) {
+  const why = endedCalls.get(id)
+  endedCalls.delete(id)
+  return why
+}
+
+// Under slot pressure, end the turn whose client has held its tool call the
+// longest once that exceeds EVICT_WAIT_MS. That client's result then replays.
+// Returns whether a turn gave up its slot.
+async function evictDetached() {
+  const now = Date.now()
+  let oldest
+  let longest = EVICT_WAIT_MS
+  for (const turn of tuiTurns) {
+    const detached = turn.detachedFor(now)
+    if (detached >= longest) {
+      oldest = turn
+      longest = detached
+    }
+  }
+  if (!oldest) return false
+  logBridgeEvent("evict", { turn: oldest.id, detached_ms: longest })
+  oldest.end("evicted")
+  await oldest.closed
+  return true
+}
+
+// decision: show client control characters as Unicode control pictures; not
+// reject the request because a history that carries terminal output would then
+// fail on every retry. Only literal text may enter the native editor.
+function literalText(text) {
+  return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, char => {
+    const code = char.charCodeAt(0)
+    return code < 0x20 ? String.fromCharCode(0x2400 + code) : code === 0x7f ? "\u2421" : "\ufffd"
+  })
 }
 
 async function tuiResponse(agy, body, selection, init, identity) {
@@ -2398,15 +2565,25 @@ async function tuiResponse(agy, body, selection, init, identity) {
     const tools = normalizeTools(body)
     const workDir = namedWorkDirectory(body, init)
     const trailing = trailingMessages(body)
-    let held
+    let held, cause
     if (blocks.length) {
       if (replayHistoryProblem(body, blocks)) throw new UnsupportedContent("unmatched or incomplete tool results")
       held = blocks.map(block => tuiCalls.get(block.tool_use_id)).find(Boolean)
-      if (held?.acceptResult(body, blocks, identity, tools, workDir, selection)) return await tuiReply(held, body, signal)
-      if (!held && (!isUserTask(trailing.messages.at(-1)) || !canReplayFollowUpAfterResults(body,
-        blocks.map(block => ({ block, result: toolResult(block) }))))) {
-        return jsonError(409, "agy bridge: the native TUI turn is no longer waiting for these tool results")
+      if (held && !held.sameIdentity(identity)) {
+        // Another session or account carries this history: serve it in its own
+        // turn and leave the owner's turn waiting for the owner's result.
+        held = undefined
+        cause = "foreign_identity"
+      } else if (held?.busy()) {
+        logBridgeEvent("reject", { turn: held.id, reason: "busy" })
+        return jsonError(409, "agy bridge: the native TUI turn is already answering another request")
+      } else if (held?.acceptResult(body, blocks, identity, tools, workDir, selection)) {
+        return await tuiReply(held, body, signal)
       }
+      // decision: replay the client's history in a new native turn when no
+      // live turn takes these results; not 409 because the client cannot make
+      // a lost turn come back, so a refusal only repeats until it gives up.
+      cause ??= held ? "superseded" : blocks.map(block => takeEndedCall(block.tool_use_id)).find(Boolean) ?? "unknown_call"
     } else if (identity.scope && isUserTask(trailing.messages.at(-1))) {
       // A standalone user message may abandon the pending call. Only reclaim
       // it if this request names the same scoped turn and matches its history.
@@ -2421,23 +2598,28 @@ async function tuiResponse(agy, body, selection, init, identity) {
     // because AGY sends all clipboard attachments after its text. Revisit when
     // AGY can preserve mixed part order through the interactive editor.
     const prompt = parts.map(part => {
-      if (part.type !== "image") return part.text
+      if (part.type !== "image") return literalText(part.text)
       images.push(part)
       return `[Image ${images.length} is attached]`
     }).join("")
     const inputParts = images.length ? [{ type: "text", text: prompt }, ...images] : undefined
     parseTuiInput(prompt, inputParts)
     if (held) {
-      held.abort.abort()
+      held.end(blocks.length ? "superseded" : "abandoned")
       await held.closed
     }
-    if (tuiTurns.size >= maxProcs()) return jsonError(503, "agy bridge: all agy process slots are busy")
+    // Checked again after each eviction, since a concurrent request can take the freed slot.
+    while (tuiTurns.size >= maxProcs()) {
+      if (await evictDetached()) continue
+      logBridgeEvent("reject", { reason: "slots", turns: tuiTurns.size })
+      return jsonError(503, "agy bridge: all agy process slots are busy")
+    }
     if (signal?.aborted) return jsonError(499, "agy bridge: the TUI turn was cancelled")
     const turn = new TuiTurn(tools, body, identity, workDir, selection)
     turn.start(agy, {
       prompt, parts: inputParts, ...selection,
       timeoutMs: configuredTimeout("AGY_BRIDGE_TURN_TIMEOUT_MS", TURN_TIMEOUT_MS), env: childEnv(),
-    })
+    }, cause)
     return await tuiReply(turn, body, signal)
   } catch (error) {
     return jsonError(error.statusCode ?? 502, error.message, error.code,
@@ -2446,12 +2628,19 @@ async function tuiResponse(agy, body, selection, init, identity) {
 }
 
 async function tuiReply(turn, body, signal) {
+  try { return await tuiMessage(turn, body, signal) } finally { turn.reading = false }
+}
+
+async function tuiMessage(turn, body, signal) {
   const { call, result = {}, error } = await turn.next(signal)
   if (error) throw error
+  if (call) await turn.usageThrough(call.ordinal)
   if (signal?.aborted) {
-    turn.abort.abort()
+    turn.end("client_cancelled")
     throw Object.assign(new Error("agy bridge: the TUI turn was cancelled"), { statusCode: 499 })
   }
+  // The turn ended while this call waited for its usage row; its MCP request is gone.
+  if (call && turn.ended) throw turn.ended.error ?? Object.assign(new Error("agy bridge: the native TUI turn ended"), { statusCode: 502 })
   const id = `msg_agy_${randomBytes(12).toString("hex")}`
   const thinking = FORWARD_THINKING && body.thinking?.type !== "disabled" ? result.thinking : ""
   const content = [
@@ -2460,8 +2649,10 @@ async function tuiReply(turn, body, signal) {
     ...(call ? [call.block] : []),
   ]
   if (call) turn.expose(call, body, content)
-  const usage = { input_tokens: tokenCount(result.inputTokens), output_tokens: tokenCount(result.outputTokens),
-    cache_read_input_tokens: tokenCount(result.cacheReadTokens), cache_creation_input_tokens: 0 }
+  const steps = turn.takeUsage(call ? turn.usage : result)
+  // AGY 1.5.18 records no cache-write count for a step, so none is reported.
+  const usage = { input_tokens: steps.inputTokens, output_tokens: steps.outputTokens,
+    cache_read_input_tokens: steps.cacheReadTokens, cache_creation_input_tokens: 0 }
   const message = { id, type: "message", role: "assistant", model: body.model, content,
     stop_reason: call ? "tool_use" : "end_turn", stop_sequence: null, usage }
   const headers = { "X-Magpie-Agy-Mode": "tui" }

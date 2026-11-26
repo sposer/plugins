@@ -34,6 +34,18 @@ test("TUI sends text history and returns the native result to JSON and SSE clien
     prompt.includes("What is the test word?")))
 })
 
+test("control characters in the client history reach the native editor as visible text", async t => {
+  const prompts = []
+  const kit = await createBridgeKit({ runTui: async (_file, { prompt }) => { prompts.push(prompt); return { text: "red" } } })
+  t.after(() => kit.dispose())
+  const response = await kit.request({ ...request, stream: false, messages: [
+    ...request.messages.slice(0, -1), { role: "user", content: "Which colour is \x1b[31mthis\x1b[0m?\x07\x7f" },
+  ] })
+  assert.equal(response.status, 200)
+  assert.match(prompts[0], /Which colour is ␛\[31mthis␛\[0m\?␇␡/)
+  assert.doesNotMatch(prompts[0], /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/)
+})
+
 test("the cached native catalog selects exact model IDs in the PTY command", async t => {
   const launches = []
   const kit = await createBridgeKit({ onTuiLaunch: args => launches.push(args) })
@@ -79,12 +91,30 @@ test("the cached native catalog selects exact model IDs in the PTY command", asy
   assert.deepEqual(kit.modelsSpawns, [])
 })
 
-test("client tool results from a standard Request resume only the original scoped TUI", async t => {
+// Calls the first bridge tool and returns its result, or ends quietly once the turn is aborted.
+const callOnce = kit => async (_file, { mcp, signal }) => {
+  if (!mcp) return { text: "text-only turn" }
+  const call = await Promise.race([
+    kit.control({ token: mcp.token, kind: "call", name: mcp.tools[0].name, arguments: { path: "lemon.txt" } }),
+    once(signal, "abort").then(() => null),
+  ])
+  if (!call) throw Object.assign(new Error("turn cancelled"), { statusCode: 499 })
+  return { text: call.result.content[0].text }
+}
+
+const withResult = (initial, content, value) => ({ ...initial, stream: false, messages: [...initial.messages,
+  { role: "assistant", content }, { role: "user", content: [{ type: "tool_result", tool_use_id: content.at(-1).id, content: value }] },
+] })
+
+test("client tool results resume only the original scoped TUI, and other requests replay their history", async t => {
   const kit = await createBridgeKit({
-    runTui: async (_file, { mcp }) => {
+    runTui: async (_file, { mcp, signal }) => {
       const { result: { tools } } = await kit.control({ token: mcp.token, kind: "list" })
-      const call = await kit.control({ token: mcp.token, kind: "call", name: tools[0].name, arguments: { path: "lemon.txt" } })
-      return { text: call.result.content[0].text }
+      const call = await Promise.race([
+        kit.control({ token: mcp.token, kind: "call", name: tools[0].name, arguments: { path: "lemon.txt" } }),
+        once(signal, "abort").then(() => null),
+      ])
+      return { text: call ? call.result.content[0].text : "ended" }
     },
   })
   t.after(() => kit.dispose())
@@ -102,8 +132,15 @@ test("client tool results from a standard Request resume only the original scope
   const viaRequest = (body, session) => kit.fetch(new Request(MESSAGES_URL, {
     method: "POST", headers: { "X-Magpie-Session": session }, body: JSON.stringify(body),
   }))
+  // Another session's copy of the history runs in its own turn; the owner's turn keeps waiting.
   const foreign = await viaRequest(followUp, "another")
-  assert.equal(foreign.status, 409)
+  assert.equal(foreign.status, 200)
+  const replayed = await foreign.json()
+  assert.equal(replayed.stop_reason, "tool_use")
+  assert.notEqual(replayed.content.at(-1).id, call.id)
+  assert.equal(kit.tuiRuns.length, 2)
+  assert.match(kit.tuiRuns[1].prompt, /lemon found/)
+  assert.equal(kit.tuiRuns[0].signal.aborted, false)
   const mixed = { ...followUp, messages: [...initial.messages,
     { role: "assistant", content: [{ ...call, id: "toolu_foreign" }] }, followUp.messages.at(-1),
   ] }
@@ -114,8 +151,72 @@ test("client tool results from a standard Request resume only the original scope
   const finished = await viaRequest(normalized, "original")
   assert.equal(finished.status, 200)
   assert.deepEqual((await finished.json()).content, [{ type: "text", text: "lemon found" }])
-  assert.equal((await viaRequest(followUp, "original")).status, 409)
-  assert.equal(kit.tuiRuns.length, 1)
+  assert.equal(kit.tuiRuns.length, 2)
+  // A result repeated after its turn finished is replayed, not refused.
+  const repeated = await viaRequest(followUp, "original")
+  assert.equal(repeated.status, 200)
+  assert.equal(kit.tuiRuns.length, 3)
+  assert.match(kit.tuiRuns[2].prompt, /lemon found/)
+})
+
+test("a turn whose client holds its tool call gives up its slot only under pressure, and the result replays", async t => {
+  const kit = await createBridgeKit({ env: { AGY_BRIDGE_MAX_PROCS: "1" }, runTui: (...args) => callOnce(kit)(...args) })
+  t.after(() => kit.dispose())
+  const initial = baseBody()
+  const { content } = await readSse(await kit.request(initial))
+  // A client that just received its call keeps the slot.
+  assert.equal((await kit.request(request)).status, 503)
+  assert.equal(kit.tuiRuns[0].signal.aborted, false)
+  kit.advance(30_000)
+  const other = await kit.request({ ...request, stream: false })
+  assert.equal(other.status, 200)
+  assert.deepEqual((await other.json()).content, [{ type: "text", text: "text-only turn" }])
+  assert.equal(kit.tuiRuns[0].signal.aborted, true)
+  const late = await kit.request(withResult(initial, content, "lemon found"))
+  assert.equal(late.status, 200)
+  assert.equal(kit.tuiRuns.length, 3)
+  assert.match(kit.tuiRuns[2].prompt, /lemon found/)
+})
+
+test("a tool result that does not come back in time ends the turn, and the late result replays", async t => {
+  const kit = await createBridgeKit({ env: { AGY_BRIDGE_TOOL_TIMEOUT_MS: "20" }, runTui: (...args) => callOnce(kit)(...args) })
+  t.after(() => kit.dispose())
+  const initial = baseBody()
+  const { content } = await readSse(await kit.request(initial))
+  const { signal, mcp } = kit.tuiRuns[0]
+  if (!signal.aborted) await once(signal, "abort", { signal: AbortSignal.timeout(1000) })
+  await tick()
+  assert.equal((await kit.control({ token: mcp.token, kind: "list" })).error.code, -32603)
+  const late = await kit.request(withResult(initial, content, "lemon found"))
+  assert.equal(late.status, 200)
+  assert.equal(kit.tuiRuns.length, 2)
+  assert.match(kit.tuiRuns[1].prompt, /lemon found/)
+})
+
+test("each response reports the tokens of the native steps since the previous response", async t => {
+  const kit = await createBridgeKit({
+    runTui: async (_file, { mcp, observer }) => {
+      const steps = (inputTokens, outputTokens, cacheReadTokens, count, toolCalls) =>
+        observer.progress({ inputTokens, outputTokens, cacheReadTokens, steps: count, toolCalls })
+      observer.phase("ready")
+      observer.phase("submitted")
+      steps(0, 0, 0, 0, 0)
+      const call = kit.control({ token: mcp.token, kind: "call", name: mcp.tools[0].name, arguments: { path: "lemon.txt" } })
+      // The MCP call can arrive before the polled transcript shows its planner step.
+      setTimeout(() => steps(10, 3, 4, 1, 1), 30)
+      await call
+      steps(25, 8, 9, 2, 1)
+      return { text: "done", inputTokens: 25, outputTokens: 8, cacheReadTokens: 9 }
+    },
+  })
+  t.after(() => kit.dispose())
+  const initial = { ...baseBody(), stream: false }
+  const first = await (await kit.request(initial)).json()
+  assert.equal(first.stop_reason, "tool_use")
+  assert.deepEqual(first.usage, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 })
+  const last = await (await kit.request(withResult(initial, first.content, "lemon found"))).json()
+  assert.equal(last.stop_reason, "end_turn")
+  assert.deepEqual(last.usage, { input_tokens: 15, output_tokens: 5, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 })
 })
 
 test("invalid replay input leaves the live tool open, but a removed catalog starts a new TUI", async t => {
