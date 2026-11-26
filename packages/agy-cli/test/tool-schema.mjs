@@ -445,6 +445,27 @@ test("const literals: numeric and boolean unions keep their values, empty string
   assert.deepEqual(p.maybe, { type: ["string", "null"], description: 'Allowed values: "a", "b", null' })
   // Standalone null leaves have no `"type": "null"` or `["null"]`.
   assert.doesNotMatch(JSON.stringify({ nothing: p.nothing, allNull: p.allNull }), /"type"/)
+
+  const untyped = fullPipeline({
+    type: "object",
+    properties: {
+      untypedNullable: { description: "Theme", anyOf: [{ enum: ["light", "dark"] }, { type: "null" }] },
+      enumNullBranch: { anyOf: [{ type: "string", enum: ["a", "b"] }, { enum: [null] }] },
+      untypedUnion: { anyOf: [{ enum: ["x"] }, { enum: ["y"] }] },
+    },
+  })
+  assert.deepEqual(untyped.properties.untypedNullable, {
+    type: ["string", "null"],
+    description: 'Theme (Allowed values: "light", "dark", null)',
+  })
+  assert.deepEqual(untyped.properties.enumNullBranch, {
+    type: ["string", "null"],
+    description: 'Allowed values: "a", "b", null',
+  })
+  assert.deepEqual(untyped.properties.untypedUnion, {
+    type: "string",
+    enum: ["x", "y"],
+  })
 })
 
 test("variant hints keep per-variant descriptions and stay under a length cap", () => {
@@ -724,6 +745,87 @@ test("bridge tools/list keeps every tool of a catalog over agy's budget, within 
       assert.deepEqual(t.inputSchema.properties.mode.enum, ["fast", "safe"])
       assert.equal(t.inputSchema.properties.mode.description, "How.")
       assert.equal(t._meta?.["antigravity/alwaysLoad"], true)
+    }
+  } finally {
+    await kit.dispose()
+  }
+})
+
+test("bridge tools/list preserves nullable enum and constraint hints under lean budget trimming", async () => {
+  const kit = await createBridgeKit()
+  try {
+    let listed = null
+    kit.prompts.push(async (agent) => {
+      listed = await agent.listTools()
+      await agent.text("checked nullable enums")
+    })
+    const prose = (n) => "Controls execution behavior across the workspace. ".repeat(n) + "Examples: run('a'), run('b')."
+    const cases = [
+      {
+        key: "colorScheme",
+        schema: {
+          description: prose(3),
+          anyOf: [{ type: "string", enum: ["light", "dark"] }, { type: "null" }],
+        },
+        type: ["string", "null"],
+        pattern: /Allowed values: "light", "dark", null/,
+      },
+      {
+        key: "untypedMode",
+        schema: {
+          anyOf: [{ enum: ["auto", "manual"] }, { type: "null" }],
+        },
+        type: ["string", "null"],
+        exact: 'Allowed values: "auto", "manual", null',
+      },
+      {
+        key: "formatCode",
+        schema: {
+          description: prose(2),
+          const: 2,
+        },
+        type: "integer",
+        pattern: /Must equal: 2/,
+      },
+      {
+        key: "target",
+        schema: {
+          description: prose(2),
+          type: ["string", "integer"],
+        },
+        type: "string",
+        pattern: /Accepts types: string \| integer/,
+      },
+    ]
+    const tools = Array.from({ length: 130 }, (_, i) => {
+      const c = cases[i % cases.length]
+      return {
+        name: `oh_tool_${i}`,
+        description: prose(4),
+        input_schema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: prose(4) },
+            note: { type: "string", description: prose(4) },
+            detail: { type: "string", description: prose(4) },
+            [c.key]: c.schema,
+          },
+        },
+      }
+    })
+    const tokens = (list) => list.reduce((n, t) => n + Math.ceil(Buffer.byteLength(JSON.stringify(t), "utf8") / 3), 0)
+    const res = await kit.request(baseBody({ tools }))
+    await readSse(res)
+    const mcpTools = listed?.result?.tools ?? []
+    assert.deepEqual(mcpTools.map((t) => t.name), tools.map((t) => t.name))
+    assert.ok(tokens(mcpTools) <= 18000, `fits (${tokens(mcpTools)})`)
+    for (let i = 0; i < mcpTools.length; i++) {
+      const p = mcpTools[i].inputSchema.properties
+      const c = cases[i % cases.length]
+      assert.equal(p.path.description, undefined, "ordinary long description dropped in lean mode")
+      assert.deepEqual(p[c.key].type, c.type)
+      if (c.exact) assert.equal(p[c.key].description, c.exact)
+      else assert.match(p[c.key].description ?? "", c.pattern)
     }
   } finally {
     await kit.dispose()

@@ -104,6 +104,8 @@ test("a list type keeps what it allowed", () => {
   expect(g({ type: "array", items: [{ type: "string" }, { type: "number" }] })).toEqual({ type: "array", items: {} })
   expect(g({ enum: [1, 2] })).toEqual({ type: "integer", enum: [1, 2] })
   expect(g({ enum: ["x", null] })).toEqual({ type: "string", enum: ["x"], nullable: true })
+  expect(g({ type: ["string", "null"], enum: ["light", "dark", null] })).toEqual({ type: "string", enum: ["light", "dark"], nullable: true })
+  expect(g({ enum: [null] })).toEqual({ nullable: true })
   expect(g({ enum: ["x", 1] })).toEqual({})
 })
 

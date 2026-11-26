@@ -824,16 +824,43 @@ function plainSchema(root) {
     if ((x.anyOf != null || x.oneOf != null) && ownShape(x)) return walk(foldUnion(x, resolve), depth + 1, path)
     for (const k of ["anyOf", "oneOf"]) {
       if (!Array.isArray(x[k])) continue
-      let pick = null
+      const isNullBranch = (m) =>
+        m?.type === "null" ||
+        (m?.const === null && m?.type == null) ||
+        (Array.isArray(m?.enum) && m.enum.length > 0 && m.enum.every((v) => v === null) && m?.type == null)
+      const nonNull = []
       let nullable = false
       for (const a of x[k]) {
         const m = isObj(a) ? a : null
-        if (m?.type === "null") nullable = true
-        else if (!pick && m) pick = m
+        if (isNullBranch(m)) nullable = true
+        else if (m) nonNull.push(m)
+      }
+      const stringLiterals = (m) => {
+        if (m.properties != null || m.items != null) return null
+        if (m.type != null) {
+          const ts = Array.isArray(m.type) ? m.type.filter((t) => t !== "null") : [m.type]
+          if (ts.length !== 1 || ts[0] !== "string") return null
+        }
+        if ("const" in m) return typeof m.const === "string" ? { vals: [m.const], hasNull: false } : null
+        if (Array.isArray(m.enum) && m.enum.length) {
+          const rest = m.enum.filter((v) => v !== null)
+          if (rest.length && rest.every((v) => typeof v === "string")) {
+            return { vals: rest, hasNull: rest.length < m.enum.length }
+          }
+        }
+        return null
       }
       let out = {}
-      if (pick) {
-        const m = walk(pick, depth + 1, path + "/" + k)
+      const literalBranches = nonNull.length > 1 ? nonNull.map((b) => stringLiterals(resolve(b) ?? b)) : null
+      if (literalBranches && literalBranches.every(Boolean)) {
+        out = { type: "string" }
+        const strs = distinct(literalBranches.flatMap((b) => b.vals).filter((s) => s.trim() !== ""))
+        if (strs.length) out.enum = strs
+        if (literalBranches.some((b) => b.hasNull) || nonNull.some((b) => { const r = resolve(b) ?? b; return Array.isArray(r.type) && r.type.includes("null") })) {
+          nullable = true
+        }
+      } else if (nonNull[0]) {
+        const m = walk(nonNull[0], depth + 1, path + "/" + k)
         if (isObj(m)) out = m
       }
       if (typeof x.description === "string" && out.description == null) out.description = x.description
@@ -878,9 +905,13 @@ function plainSchema(root) {
           out.maxItems = 0
         }
       } else if (k === "enum") {
-        if (Array.isArray(val) && val.every((e) => typeof e === "string")) {
-          const strs = val.filter((s) => s.trim() !== "")
-          if (strs.length) out.enum = strs
+        if (Array.isArray(val)) {
+          const nonNull = val.filter((e) => e !== null)
+          if (nonNull.length < val.length) out.nullable = true
+          if (nonNull.length && nonNull.every((e) => typeof e === "string")) {
+            const strs = nonNull.filter((s) => s.trim() !== "")
+            if (strs.length) out.enum = strs
+          }
         }
       }
     }

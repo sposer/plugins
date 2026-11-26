@@ -144,3 +144,157 @@ test("cut stops on a whole character, within the bytes, and drops the examples f
   assert.equal(cut("short", 100), "short")
   assert.equal(cut("anything longer", 3), null)
 })
+
+test("cut preserves trailing schema-constraint hints ahead of prose and Examples", () => {
+  const withExamples = 'Controls how the tool formats output. Examples: "compact", "verbose" (Allowed values: "compact", "verbose", "json", null)'
+  // Dropping Examples from prose must not eat the trailing Allowed values hint.
+  assert.equal(
+    cut(withExamples, 100),
+    'Controls how the tool formats output. (Allowed values: "compact", "verbose", "json", null)',
+  )
+  // When only enough room for the hint remains, drop prose cleanly without stubs.
+  assert.equal(
+    cut(withExamples, 65),
+    'Allowed values: "compact", "verbose", "json", null',
+  )
+  // Nested parens in Variants and parens inside quoted enum values stay intact.
+  const nestedVariants = 'Selects the desktop operation to execute across windows (Variants: { method: "click" } (Click at coords) | { method: "shot" } (Take shot))'
+  assert.equal(
+    cut(nestedVariants, 95),
+    'Variants: { method: "click" } (Click at coords) | { method: "shot" } (Take shot)',
+  )
+  const quotedParens = 'Format selector for structured replies (Allowed values: "a)", "b(", null)'
+  assert.equal(cut(quotedParens, 40), 'Allowed values: "a)", "b(", null')
+
+  // Chained trailing hints keep balanced parens when prose is dropped.
+  const chained = 'Config value used across requests (Accepts types: string | integer) (Allowed values: "auto", 1, null)'
+  assert.equal(
+    cut(chained, 75),
+    '(Accepts types: string | integer) (Allowed values: "auto", 1, null)',
+  )
+
+  // Monotonicity and byte bound across every cap from 0 to full length.
+  let prev = 0
+  for (let max = 0; max <= bytes(withExamples) + 5; max++) {
+    const out = cut(withExamples, max)
+    const len = out ? bytes(out) : 0
+    assert.ok(len <= max, `max=${max}: ${out}`)
+    assert.ok(len >= prev, `non-monotonic at max=${max}: ${prev} -> ${len} (${out})`)
+    prev = len
+  }
+})
+
+test("lean mode protects lowered enum/const/type constraint hints in heavy catalogs", () => {
+  const hintVariants = [
+    {
+      key: "theme",
+      schema: {
+        type: ["string", "null"],
+        description: `${long("theme", 2)} (Allowed values: "light", "dark", null)`,
+      },
+      pattern: /Allowed values: "light", "dark", null/,
+    },
+    {
+      key: "bare_enum",
+      schema: {
+        type: ["string", "null"],
+        description: 'Allowed values: "fast", "safe", null',
+      },
+      exact: 'Allowed values: "fast", "safe", null',
+    },
+    {
+      key: "version",
+      schema: {
+        type: "integer",
+        description: `${long("version", 2)} (Must equal: 2)`,
+      },
+      pattern: /Must equal: 2/,
+    },
+    {
+      key: "mode",
+      schema: {
+        type: "string",
+        description: `${long("mode", 2)} (Known values include: "auto", "manual")`,
+      },
+      pattern: /Known values include: "auto", "manual"/,
+    },
+    {
+      key: "target",
+      schema: {
+        type: "string",
+        description: `${long("target", 2)} (Accepts types: string | integer)`,
+      },
+      pattern: /Accepts types: string \| integer/,
+    },
+    {
+      key: "empty",
+      schema: {
+        description: `${long("empty", 2)} (Must be null.)`,
+      },
+      pattern: /Must be null\./,
+    },
+  ]
+  const tools = Array.from({ length: 131 }, (_, i) => {
+    const variant = hintVariants[i % hintVariants.length]
+    return {
+      name: `tool_${i}`,
+      description: long(`tool_${i}`, 3),
+      inputSchema: {
+        type: "object",
+        properties: {
+          field_0: { type: "string", description: long(`field_0_${i}`, 2) },
+          field_1: { type: "string", description: long(`field_1_${i}`, 2) },
+          field_2: { type: "string", description: long(`field_2_${i}`, 2) },
+          flag: { type: "boolean", description: "Short." },
+          [variant.key]: variant.schema,
+        },
+      },
+    }
+  })
+  assert.ok(total(tools) > 20000, `fixture exceeds budget (${total(tools)})`)
+  const fitted = fitTools(tools)
+  assert.ok(total(fitted) <= TOOL_TOKEN_BUDGET, `fits (${total(fitted)})`)
+  assert.deepEqual(fitted.map((t) => t.name), tools.map((t) => t.name))
+  for (let i = 0; i < fitted.length; i++) {
+    const p = fitted[i].inputSchema.properties
+    const variant = hintVariants[i % hintVariants.length]
+    assert.equal(p.field_0.description, undefined, "ordinary long description dropped in lean mode")
+    assert.equal(p.flag.description, "Short.", "short ordinary description stays whole")
+    if (variant.exact) assert.equal(p[variant.key].description, variant.exact)
+    else assert.match(p[variant.key].description ?? "", variant.pattern)
+  }
+})
+
+test("lean mode pins longer enum hints under tight budgets before spending on prose", () => {
+  const longHint = 'Allowed values: "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", null'
+  const tools = Array.from({ length: 160 }, (_, i) => ({
+    name: `tight_${i}`,
+    description: long(`tight_${i}`, 3),
+    inputSchema: {
+      type: "object",
+      properties: {
+        a: { type: "string", description: long(`a_${i}`, 2) },
+        b: { type: "string", description: long(`b_${i}`, 2) },
+        c: { type: "string", description: long(`c_${i}`, 2) },
+        view: { type: "object", description: long(`view_${i}`, 4) },
+        ...(i < 20
+          ? {
+              preset: {
+                type: ["string", "null"],
+                description: `${long("preset", 3)} (${longHint})`,
+              },
+            }
+          : {}),
+      },
+    },
+  }))
+  const fitted = fitTools(tools)
+  assert.ok(total(fitted) <= TOOL_TOKEN_BUDGET, `fits (${total(fitted)})`)
+  for (let i = 0; i < 20; i++) {
+    assert.equal(fitted[i].inputSchema.properties.a.description, undefined)
+    assert.ok(
+      (fitted[i].inputSchema.properties.preset.description ?? "").includes(longHint),
+      `tool ${i} lost full enum hint: ${fitted[i].inputSchema.properties.preset.description}`,
+    )
+  }
+})

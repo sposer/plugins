@@ -1456,15 +1456,21 @@ function geminiSchema(s, depth = 0) {
       else out.allOf = [...(Array.isArray(out.allOf) ? out.allOf : []), { oneOf: some }]
     }
   }
-  if (out.type === undefined && Array.isArray(out.enum)) {
+  if (Array.isArray(out.enum)) {
     const vals = out.enum.filter((v) => v !== null)
-    if (vals.length < out.enum.length) out.nullable = true
-    const kinds = new Set(vals.map((v) => (Number.isInteger(v) ? "integer" : typeof v)))
-    const one = kinds.size === 1 ? [...kinds][0] : kinds.size === 2 && kinds.has("integer") && kinds.has("number") ? "number" : ""
-    if (["string", "integer", "number", "boolean"].includes(one)) {
-      out.type = one
-      out.enum = vals
-    } else delete out.enum
+    if (vals.length < out.enum.length && out.type !== "null") {
+      out.nullable = true
+      if (vals.length) out.enum = vals
+      else delete out.enum
+    }
+    if (out.type === undefined && Array.isArray(out.enum)) {
+      const kinds = new Set(vals.map((v) => (Number.isInteger(v) ? "integer" : typeof v)))
+      const one = kinds.size === 1 ? [...kinds][0] : kinds.size === 2 && kinds.has("integer") && kinds.has("number") ? "number" : ""
+      if (["string", "integer", "number", "boolean"].includes(one)) {
+        out.type = one
+        out.enum = vals
+      } else delete out.enum
+    }
   }
   if (out.type === undefined && isObj(out.properties)) out.type = "object"
   if (out.type === "array" || (out.type === undefined && Object.hasOwn(out, "items"))) {

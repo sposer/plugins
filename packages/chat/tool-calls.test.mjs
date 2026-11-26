@@ -3,7 +3,7 @@
 // {"a"}{"b"} arguments (plugins#930). Fragments with no id, or the same
 // id, go on with the open call.
 import { expect, test } from "bun:test";
-import { toolCallFolder } from "./lib/server.mjs";
+import { slimSchema, toolCallFolder } from "./lib/server.mjs";
 
 const fold = (fragments) => {
   const calls = toolCallFolder();
@@ -30,4 +30,38 @@ test("fragments with no id, or the same id, go on with the open call", () => {
     { index: 0, function: { arguments: 'y":' } },
     { index: 0, id: "call_fixture_A", function: { arguments: '"A"}' } },
   ])).toEqual([{ id: "call_fixture_A", name: "fixture_alpha", args: '{"key":"A"}' }]);
+});
+
+test("slimSchema preserves nullable anyOf/oneOf enum values and scalar types", () => {
+  expect(slimSchema({
+    type: "object",
+    properties: {
+      theme: {
+        description: "Preferred theme\nSecond line",
+        anyOf: [{ type: "string", enum: ["light", "dark"] }, { type: "null" }],
+      },
+      mode: {
+        oneOf: [{ const: "fast" }, { const: "safe" }, { type: "null" }],
+      },
+      typeList: {
+        type: ["string", "null"],
+        enum: ["a", "b", null],
+      },
+      limit: {
+        anyOf: [{ type: "integer" }, { type: "null" }],
+      },
+      tags: {
+        anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
+      },
+    },
+  })).toEqual({
+    type: "object",
+    properties: {
+      theme: { type: "string", description: "Preferred theme", enum: ["light", "dark"] },
+      mode: { type: "string", enum: ["fast", "safe"] },
+      typeList: { type: "string", enum: ["a", "b"] },
+      limit: { type: "integer" },
+      tags: { type: "array", items: { type: "string" } },
+    },
+  });
 });

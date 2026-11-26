@@ -116,6 +116,10 @@ function isNullType(type) {
 function isNullSchema(schema) {
   if (!isObject(schema)) return false
   if (isNullType(schema.type)) return true
+  if (schema.type === undefined && Array.isArray(schema.enum) && schema.enum.length > 0 &&
+      schema.enum.every((v) => v === null)) {
+    return true
+  }
   // A lowered `const: null` leaf (no type, only the null hint).
   return schema.type === undefined && typeof schema.description === "string" &&
     schema.description.includes(NULL_HINT) && schema.properties === undefined &&
@@ -140,6 +144,21 @@ function isObjectBranch(schema) {
     schema.additionalProperties !== undefined || isObject(schema.patternProperties)
 }
 
+function enumPrimitiveType(values) {
+  if (!Array.isArray(values) || !values.length) return null
+  const types = new Set()
+  for (const v of values) {
+    if (v === null) continue
+    if (typeof v === "string") types.add("string")
+    else if (typeof v === "boolean") types.add("boolean")
+    else if (typeof v === "number" && Number.isFinite(v)) types.add(Number.isInteger(v) ? "integer" : "number")
+    else return null
+  }
+  if (types.size === 1) return [...types][0]
+  if (types.size === 2 && types.has("number") && types.has("integer")) return "number"
+  return null
+}
+
 function primitiveTypeOf(schema) {
   if (!isObject(schema)) return null
   const raw = typeof schema.type === "string"
@@ -147,9 +166,14 @@ function primitiveTypeOf(schema) {
     : Array.isArray(schema.type)
       ? schema.type.filter((t) => t !== "null")
       : []
-  if (raw.length !== 1) return null
-  const t = raw[0]
-  return (t === "string" || t === "number" || t === "integer" || t === "boolean") ? t : null
+  if (raw.length === 1) {
+    const t = raw[0]
+    return (t === "string" || t === "number" || t === "integer" || t === "boolean") ? t : null
+  }
+  if (raw.length === 0 && schema.type === undefined && Array.isArray(schema.enum)) {
+    return enumPrimitiveType(schema.enum)
+  }
+  return null
 }
 
 // Stand-in for a subtree that is not expanded (recursion, depth or budget):
@@ -340,7 +364,7 @@ function unionPropertySchemas(schemas) {
   if (meaningful.length === 1) return { ...meaningful[0] }
   const nonNull = meaningful.filter((b) => !isNullSchema(b))
   const hasNull = nonNull.length < meaningful.length ||
-    meaningful.some((b) => Array.isArray(b.type) && b.type.includes("null"))
+    meaningful.some((b) => (Array.isArray(b.type) && b.type.includes("null")) || (Array.isArray(b.enum) && b.enum.includes(null)))
   if (!nonNull.length) return { description: NULL_HINT }
   if (nonNull.every(isObjectBranch)) return unionObjectBranches(nonNull, hasNull)
   const family = primitiveFamily(nonNull)
@@ -411,7 +435,7 @@ function lowerUnionKey(out, key) {
   }
   const nonNull = branches.filter((b) => !isNullSchema(b))
   const hasNull = nonNull.length < branches.length ||
-    branches.some((b) => Array.isArray(b?.type) && b.type.includes("null"))
+    branches.some((b) => (Array.isArray(b?.type) && b.type.includes("null")) || (Array.isArray(b?.enum) && b.enum.includes(null)))
 
   if (!nonNull.length) {
     delete out[key]

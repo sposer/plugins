@@ -24,27 +24,82 @@ const tokensOf = (tools) => tools.reduce((n, tool) => n + agyTokens(JSON.stringi
 const DECOR = new Set(["$schema", "title", "examples"])
 
 // A property whose description is its contract: an object with no
-// properties of its own, or one whose description carries the branches
-// tool-schema.mjs folded out of an anyOf/oneOf. Its text is the only place
-// the model learns what goes in it, so it keeps more of it.
+// properties of its own, or one whose description carries schema constraints
+// that tool-schema.mjs or sanitizeInputSchema lowered into text (unions,
+// nullable/non-string enums, const values, open enums, multi-type unions).
+// Its text is the only place the model learns what goes in it, so it keeps
+// more of it and preserves trailing constraint hints ahead of prose.
+// decision: protect lowered constraint hints as contracts and preserve
+// trailing hints during truncation; not keep native enum on nullable string
+// fields because CloudCode rejects null in enum, JSON Schema 2020-12 rejects
+// null when enum omits null, and dropping null narrows the client contract;
+// revisit when agy's CloudCode translator honors primitive anyOf unions natively.
 const CONTRACT_WEIGHT = 11
 const TOOL_WEIGHT = 2.5
+const MAX_HINT_FLOOR = 512
+
+const CONTRACT_HINT_RE = /\b(?:Variants|Accepts anyOf|Allowed values|Must equal|Known values include|Accepts types):|\bMust be null\./
+const CONTRACT_HINT_START_RE = /^(?:(?:Variants|Accepts anyOf|Allowed values|Must equal|Known values include|Accepts types):|Must be null\.)/
+const SCALAR_HINT_START_RE = /^\(?(?:(?:Allowed values|Must equal|Known values include|Accepts types):|Must be null\.)/
+const CONTRACT_HINT_PAREN_RE = /\s+\((?=(?:Variants|Accepts anyOf|Allowed values|Must equal|Known values include|Accepts types):|Must be null\.)/
+const CONTRACT_HINT_INLINE_RE = /\s+(?=(?:Variants|Accepts anyOf|Allowed values|Must equal|Known values include|Accepts types):|Must be null\.)/
 
 function isContract(node) {
   if (!node || typeof node !== "object") return false
   const d = typeof node.description === "string" ? node.description : ""
-  if (/\b(Variants|Accepts anyOf):/.test(d)) return true
+  if (CONTRACT_HINT_RE.test(d)) return true
   const types = Array.isArray(node.type) ? node.type : [node.type]
   return types.includes("object") && !(node.properties && Object.keys(node.properties).length)
 }
 
-// cut shortens text to at most max UTF-8 bytes. It drops a trailing
-// Examples block first, then ends on a sentence boundary where one is near,
-// else on a whole code point, and marks the cut with "…". null when nothing
-// worth keeping fits.
-export function cut(text, max) {
+function unwrapOuterParens(s) {
+  if (!s.startsWith("(") || !s.endsWith(")")) return s
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === "\\") escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === "(") depth++
+    else if (ch === ")") {
+      depth--
+      if (depth === 0) return i === s.length - 1 ? s.slice(1, -1) : s
+    }
+  }
+  return s
+}
+
+function splitContractHint(text) {
+  const trimmed = text.trim()
+  const unwrapped = unwrapOuterParens(trimmed)
+  if (CONTRACT_HINT_START_RE.test(unwrapped)) {
+    return { prose: "", hint: trimmed, bareHint: unwrapped }
+  }
+  const paren = CONTRACT_HINT_PAREN_RE.exec(text)
+  const inline = CONTRACT_HINT_INLINE_RE.exec(text)
+  const match = paren && (!inline || paren.index <= inline.index) ? paren : inline
+  if (!match) return null
+  const prose = text.slice(0, match.index).trimEnd()
+  const hint = text.slice(match.index).trimStart()
+  return { prose, hint, bareHint: unwrapOuterParens(hint) }
+}
+
+function hintFloor(node) {
+  if (!node || typeof node !== "object" || typeof node.description !== "string") return 0
+  const split = splitContractHint(node.description)
+  if (!split || !SCALAR_HINT_START_RE.test(split.bareHint)) return 0
+  return Math.min(bytes(split.bareHint), MAX_HINT_FLOOR)
+}
+
+function cutPlain(text, max, stripExamples = true) {
   if (bytes(text) <= max) return text
-  const bare = text.replace(/\s*\bExamples?:[\s\S]*$/i, "").trimEnd()
+  const bare = stripExamples ? text.replace(/\s*\bExamples?:[\s\S]*$/i, "").trimEnd() : text
   if (bare && bytes(bare) <= max) return bare
   const room = max - bytes("…")
   if (room < 4) return null
@@ -61,16 +116,49 @@ export function cut(text, max) {
   return out.trimEnd() + "…"
 }
 
+function cutWithHint(text, max, enforceMinText) {
+  if (bytes(text) <= max) return text
+  const split = splitContractHint(text)
+  if (!split) return enforceMinText && max < MIN_TEXT ? null : cutPlain(text, max, true)
+  if (!split.prose) {
+    if (bytes(split.bareHint) <= max) return split.bareHint
+    return enforceMinText && max < MIN_TEXT ? null : cutPlain(split.bareHint, max, false)
+  }
+  if (bytes(split.bareHint) <= max) {
+    const proseRoom = max - bytes(split.hint) - 1
+    if (proseRoom > 0) {
+      const bareProse = split.prose.replace(/\s*\bExamples?:[\s\S]*$/i, "").trimEnd()
+      if (bareProse && bytes(bareProse) <= proseRoom) return `${bareProse} ${split.hint}`
+      if (proseRoom >= MIN_TEXT) {
+        const kept = cutPlain(split.prose, proseRoom, true)
+        if (kept) return `${kept} ${split.hint}`
+      }
+    }
+    return split.bareHint
+  }
+  return enforceMinText && max < MIN_TEXT ? null : cutPlain(split.bareHint, max, false)
+}
+
+// cut shortens text to at most max UTF-8 bytes. When text carries a trailing
+// schema-constraint hint, it reserves room for the hint and trims leading prose
+// (dropping a trailing Examples block from prose first); otherwise it drops a
+// trailing Examples block first, ends on a sentence boundary where one is near,
+// else on a whole code point, and marks the cut with "…". null when nothing
+// worth keeping fits.
+export function cut(text, max) {
+  return cutWithHint(text, max, false)
+}
+
 // A cut text shorter than this says nothing ("The fil…") and only spends
 // the budget on its key: such a description goes whole or not at all
 // (plugins#1140).
 export const MIN_TEXT = 24
 
-// trim is text within max bytes: whole when it fits, else cut, else null
-// when what a cut would leave is under MIN_TEXT
+// trim is text within max bytes: whole when it fits, else cut (preserving a
+// complete trailing contract hint when it fits), else null when what a cut
+// would leave is under MIN_TEXT.
 function trim(text, max) {
-  if (bytes(text) <= max) return text
-  return max < MIN_TEXT ? null : cut(text, max)
+  return cutWithHint(text, max, true)
 }
 
 // walk copies one schema node with every description capped: cap(node)
@@ -102,11 +190,16 @@ function walk(node, cap, strip) {
   return out
 }
 
-function shaped(tools, { strip, L, lean }) {
+function shaped(tools, { strip, L, lean, plainCap, pinHints = false }) {
   // lean: an ordinary property keeps only a description short enough to
   // go whole, and the room goes to the tools' own and the contracts'
-  const plain = lean ? MIN_TEXT - 1 : L
-  const prop = L === undefined ? () => Infinity : (node) => (isContract(node) ? CONTRACT_WEIGHT * L : plain)
+  const plain = plainCap !== undefined ? plainCap : (lean ? MIN_TEXT - 1 : L)
+  const prop = L === undefined
+    ? () => Infinity
+    : (node) => {
+        const base = isContract(node) ? CONTRACT_WEIGHT * L : plain
+        return pinHints ? Math.max(base, hintFloor(node)) : base
+      }
   return tools.map((tool) => {
     const out = { ...tool }
     if (tool.inputSchema && typeof tool.inputSchema === "object") out.inputSchema = walk(tool.inputSchema, prop, strip)
@@ -136,19 +229,24 @@ function highest(lo, hi, fits) {
 // description capped at the highest level that fits (a tool's own
 // description gets 2.5 times a property's, a contract property's 11 times).
 // When that level leaves an ordinary property less than MIN_TEXT, those
-// properties keep only what goes whole, and the highest level that fits
-// then goes to the tools' own descriptions and the contracts', which say
-// what each tool is for and what goes in an open object. A set too large
-// even with no descriptions at all goes as small as it can, and agy drops
-// what is left over.
+// properties keep only what goes whole, lowered scalar/enum constraint hints
+// keep enough room to stay intact (up to MAX_HINT_FLOOR), and the highest
+// level that fits goes to the tools' own descriptions and the contracts'.
+// A set too large even with no descriptions at all goes as small as it can,
+// and agy drops what is left over.
 export function fitTools(tools, budget = TOOL_TOKEN_BUDGET) {
   if (tokensOf(tools) <= budget) return tools
   const stripped = shaped(tools, { strip: true })
   if (tokensOf(stripped) <= budget) return stripped
-  const at = (L) => shaped(tools, { strip: true, L })
-  if (tokensOf(at(0)) > budget) return at(0)
+  const bare = shaped(tools, { strip: true, L: 0 })
+  if (tokensOf(bare) > budget) return bare
+  const at = (L) => shaped(tools, { strip: true, L, pinHints: L >= MIN_TEXT })
   const L = highest(0, 4000, (n) => tokensOf(at(n)) <= budget)
   if (L >= MIN_TEXT) return at(L)
+  const leanPinned = (n) => shaped(tools, { strip: true, L: n, lean: true, pinHints: true })
+  if (tokensOf(leanPinned(0)) <= budget) return leanPinned(highest(0, 4000, (n) => tokensOf(leanPinned(n)) <= budget))
+  const leanHintsOnly = (n) => shaped(tools, { strip: true, L: n, plainCap: 0, pinHints: true })
+  if (tokensOf(leanHintsOnly(0)) <= budget) return leanHintsOnly(highest(0, 4000, (n) => tokensOf(leanHintsOnly(n)) <= budget))
   const lean = (n) => shaped(tools, { strip: true, L: n, lean: true })
   if (tokensOf(lean(0)) > budget) return at(L)
   return lean(highest(0, 4000, (n) => tokensOf(lean(n)) <= budget))

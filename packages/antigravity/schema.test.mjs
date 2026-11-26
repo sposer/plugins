@@ -121,3 +121,29 @@ test("exclusive bounds and tuples", () => {
   expect(ps(`{"type":"array","prefixItems":[{"type":"string"},{"type":"number"}]}`)).toEqual({ type: "array", items: {} })
   expect(ps(`{"type":"array","items":false}`)).toEqual({ type: "array", items: {}, maxItems: 0 })
 })
+
+test("nullable string enums keep their enum values across type-list and union forms", () => {
+  expect(ps(`{"type":["string","null"],"enum":["light","dark",null],"description":"Theme"}`)).toEqual({
+    type: "string",
+    enum: ["light", "dark"],
+    nullable: true,
+    description: "Theme",
+  })
+  expect(ps(`{"description":"Theme","anyOf":[{"type":"string","const":"light"},{"type":"string","const":"dark"},{"type":"null"}]}`)).toEqual({
+    type: "string",
+    enum: ["light", "dark"],
+    nullable: true,
+    description: "Theme",
+  })
+  expect(ps(`{"anyOf":[{"const":null},{"type":"string","enum":["a","b"]}]}`)).toEqual({
+    type: "string",
+    enum: ["a", "b"],
+    nullable: true,
+  })
+  expect(ps(`{"oneOf":[{"const":"x"},{"enum":["y",""]},{"type":"null"}]}`)).toEqual({
+    type: "string",
+    enum: ["x", "y"],
+    nullable: true,
+  })
+  expect(ps(`{"enum":["a",1,null]}`)).toEqual({ nullable: true })
+})

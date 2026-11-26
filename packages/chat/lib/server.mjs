@@ -325,17 +325,47 @@ function toolsHint(tools) {
 // 工具的 schema 是提示词里最大的一块：GitHub 那 46 个工具光描述和参数就有上千万字符。
 // 只留名字、第一行说明，参数表裁到前 8 个字段、每个字段只留类型和一句说明。
 const MAX_PROPS = 8;
-function slimSchema(schema) {
+function slimProp(val) {
+  if (!val || typeof val !== "object") return { type: "string" };
+  let src = val;
+  let unionEnum = null;
+  const union = Array.isArray(val.anyOf) ? val.anyOf : Array.isArray(val.oneOf) ? val.oneOf : null;
+  if (union && !val.type && !Array.isArray(val.enum)) {
+    const isNull = (b) => b && typeof b === "object" && (b.type === "null" || (b.const === null && b.type == null));
+    const nonNull = union.filter((b) => b && typeof b === "object" && !isNull(b));
+    if (nonNull.length === 1) {
+      src = nonNull[0];
+    } else if (nonNull.length > 1) {
+      const lits = nonNull.map((b) => Array.isArray(b.enum) && b.enum.length ? b.enum : b.const !== undefined ? [b.const] : null);
+      if (lits.every(Boolean)) {
+        unionEnum = [...new Set(lits.flat().filter((v) => v !== null))];
+        src = nonNull[0];
+      }
+    }
+  }
+  const enumVals = unionEnum || (Array.isArray(src.enum) ? src.enum.filter((v) => v !== null) : src.const !== undefined && src.const !== null ? [src.const] : null);
+  const rawType = Array.isArray(src.type) ? (src.type.find((t) => t !== "null") || "string") : src.type;
+  const sample = enumVals?.[0] ?? src.const;
+  const inferredType = rawType || (
+    typeof sample === "string" ? "string"
+      : typeof sample === "boolean" ? "boolean"
+      : typeof sample === "number" ? (Number.isInteger(sample) ? "integer" : "number")
+      : "string"
+  );
+  const slim = { type: inferredType };
+  const desc = val.description || src.description;
+  if (desc) slim.description = String(desc).split("\n")[0].slice(0, 120);
+  if (enumVals && enumVals.length) slim.enum = enumVals.slice(0, 20);
+  if (slim.type === "array" && src.items?.type) slim.items = { type: src.items.type };
+  return slim;
+}
+
+export function slimSchema(schema) {
   if (!schema || typeof schema !== "object") return { type: "object", properties: {} };
   const out = { type: "object", properties: {} };
   const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
   for (const [key, val] of Object.entries(props).slice(0, MAX_PROPS)) {
-    if (!val || typeof val !== "object") { out.properties[key] = { type: "string" }; continue; }
-    const slim = { type: val.type || "string" };
-    if (val.description) slim.description = String(val.description).split("\n")[0].slice(0, 120);
-    if (Array.isArray(val.enum)) slim.enum = val.enum.slice(0, 20);
-    if (val.type === "array" && val.items?.type) slim.items = { type: val.items.type };
-    out.properties[key] = slim;
+    out.properties[key] = slimProp(val);
   }
   if (Array.isArray(schema.required) && schema.required.length) out.required = schema.required.slice(0, MAX_PROPS);
   return out;
