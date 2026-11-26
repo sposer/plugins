@@ -1,4 +1,4 @@
-// An Anthropic document block, as text for agy's ACP prompt. agy takes text
+// An Anthropic document block, as text for agy's prompt. agy takes text
 // and images: an embedded resource reaches the model as its inline text
 // only, so a PDF or other binary file can't be handed over as it is.
 //

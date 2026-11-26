@@ -1,427 +1,176 @@
 # agy-cli
 
-Turn the local Antigravity CLI (`agy`) into a model provider inside Magpie. Once
-it is set up, clients such as OpenCode and Claude Code can reach the models agy
-offers this plugin through Magpie, and every request is actually carried out by
-an `agy` process.
+Use the local Antigravity CLI (`agy`) as a model provider in Magpie. Clients
+such as OpenCode and Claude Code send Anthropic Messages requests through Magpie.
+The plugin generates replies through agy's native interactive terminal (TUI).
+Model eligibility is decided by agy and Google.
 
 **[中文 → README.md](README.md)** · Provenance, licensing and migration notes:
 [NOTICE.md](NOTICE.md)
 
-## What it is
-
-The plugin runs as a Magpie provider. By default it turns an Anthropic Messages
-request into Agent Client Protocol (ACP) messages, hands them to a local `agy acp`
-process, and streams the output back. On Linux, [native TUI](#native-tui) can
-send eligible text requests through agy's interactive entrypoint instead.
-
-- The work is done by the real agy CLI over the ACP channel it ships with. The
-  ACP handshake's `clientInfo` is the plugin's own package name and version
-  (`opencode-agy-cli-auth`), not Zed or any other editor. The plugin calls
-  Google for configured OAuth login and account validation, and reads quota
-  the way agy does when it refuses `/usage` for the account's region (see
-  "Usage quota").
-- Tools that belong to the client, such as file reads, writes and shell commands,
-  are exposed to the model over MCP. The client runs them and the results flow
-  back into the same agy conversation, so the model sees ordinary native tool
-  calls.
-- Account standing is outside the plugin's control. If Google changes its usage
-  policies, the plugin cannot promise your account will not be restricted.
-
-## How it differs from Antigravity ACP
-
-The community Antigravity ACP plugin (`antigravity-acp`) serves the same
-channel: Antigravity's models over ACP. The differences:
-
-- **What runs**: Antigravity ACP downloads Google's ACP server
-  (`agy_acp_server.par`, about 400 MB) and rides the Antigravity IDE's sign-in.
-  This plugin runs the `agy` CLI (`agy acp`): your own when you have one, and
-  when the machine has none, signing in from Magpie installs one the way
-  Google's own installer does (see "Requirements").
-- **Sessions**: Antigravity ACP opens a new session per request and carries the
-  history as context. This plugin keeps a pool of agy processes, reuses one agy
-  session for one conversation, and picks it up again with `session/resume`
-  after a restart; only when that fails does it replay the history, within a
-  byte budget.
-- **Tool calls**: Antigravity ACP ends the turn with the call as the reply's
-  `tool_calls`. This plugin feeds the client's result back into the same agy
-  turn (see "Tool bridge" below).
-- **Usage**: this plugin reads agy's own `/usage` report; Antigravity ACP reads
-  the quota each reply carries.
-
-## Tool bridge
-
-agy reaches `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. The plugin puts
-a private `nc` first on agy's PATH, which connects that line to the plugin's own
-MCP server. The control port listens on loopback only, with a token per process.
-
-- This rests on how agy dials, not on an interface agy promises. It was checked
-  on 1.4.12 and 1.5.0. On an agy older than 1.4.12 the plugin refuses the session
-  and says to update.
-- The private `nc` applies only to the agy processes the plugin starts, but for
-  those it stands in for every `nc` agy runs.
-- Every client tool is listed with `_meta: {"antigravity/alwaysLoad": true}`.
-  Without it agy loads larger tools on demand, out of the model's function
-  list, and the model cannot reach them (#989).
-
-## Features
-
-- **The models agy offers**: the list follows the model option agy advertises
-  in the ACP session. A model `agy models` lists but the session does not offer
-  this client (agy may keep Claude and GPT-OSS for clients it recognises) is
-  left out. To list models, the plugin opens one session with `agy acp` (no
-  prompt is sent) and reads what it offers; until it has, only Gemini is listed.
-  The last list agy gave and offered is kept in `models.json` beside the session
-  state file, so after a restart that list is served while agy is asked again.
-  Models and thinking levels can be switched mid-conversation without losing
-  history.
-  `agy models` runs with `--settings '{"modelProvider":""}'`, so a
-  `"modelProvider": "gemini"` (AI Studio key) in settings.json doesn't change
-  this list: it lists the Google account's models. An AI Studio key is added on
-  magpie's Providers page as Google Gemini.
-- **Streaming with thought summaries**: summaries come back as `thinking` blocks.
-  Set `AGY_BRIDGE_THINKING=0` to turn them off.
-- **Image input**: inline base64 PNG, JPEG, GIF and WebP. This needs agy 1.5.0 or
-  newer, because the ACP server has to advertise image support. An image a tool
-  returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
-  agy would save it to a file the model can't open.
-- **Tool calls**: parallel and consecutive calls both work. A tool that runs past
-  150 seconds first gets a "still running" placeholder; once the real result
-  arrives, the same turn continues, and the client executes each call exactly once.
-- **Session resume**: each finished turn is recorded. After a Magpie or plugin
-  restart, the session continues through `session/resume` as long as the history
-  and instruction hashes still match. The state file stores session IDs and
-  hashes, never message text.
-- **Isolation**: your global MCP configuration is never read. Every agy process
-  runs with a temporary agent, and every permission request agy raises for its
-  own tools (shell, file edits, browser) is refused. A request for one of the
-  client's tools on the bridge's `ide-tools` server is allowed once, since that
-  tool runs in the client under the client's own permissions. Real actions
-  happen on the client side.
-- **Assistant prefill**: requests that end with a text-only assistant message
-  (SillyTavern presets, "continue"/"impersonate", bot frameworks) are served
-  instead of rejected; the session ledger stays aligned across turns. See
-  "Assistant prefill" below.
-- **Usage visibility**: Magpie shows the agy subscription usage windows. They are
-  informational only; running out of quota does not block requests automatically.
-
-## Assistant prefill
-
-A client request that ends with a **text-only assistant message** (a
-SillyTavern preset prefill, a "continue" / "impersonate" turn, a bot
-framework's assembled context) used to be rejected with a 400. The prefill now
-becomes part of the current turn:
-
-- The prefill stays in the tail, so the session ledger (expectedMessages,
-  client bytes) stays aligned with the client's own history across turns — the
-  session is reused after a prefill turn instead of replaying from scratch;
-- The prefill text renders as a continuation carrier (a note line plus the
-  fragment itself), telling the model to continue from where the fragment
-  stops;
-- `AGY_BRIDGE_PREFILL=0` restores the stock 400 reject;
-  `AGY_BRIDGE_PREFILL_CARRIER_NOTE` overrides the carrier's note line.
-
-Known limits: a prefill alongside a live tool_result, or directly after an
-unanswered tool_use, is still rejected; a
-contiguous assistant tail with no user message before it is treated as one
-prefill run (that turn degrades to a fresh session and self-heals on the next
-turn); the models a client gets remain agy's decision.
-
 ## Requirements
 
-- The Antigravity CLI (`agy`) with the `acp` subcommand. On a machine without
-  agy (Magpie's Docker container, say), Sign in in Magpie 0.1.4246 or later
-  installs it first: downloaded from where Google's install script gets it,
-  checked against its sha512, and kept in the data folder
-  (`$XDG_DATA_HOME/magpie-agy-cli/agy`, else `~/.local/share/magpie-agy-cli/agy`;
-  `%LOCALAPPDATA%\magpie-agy-cli\agy.exe` on Windows). In the container that
-  folder is on the /config volume, so it survives a restart. An agy you
-  installed yourself comes first. Signing in from Magpie
-  needs agy 1.5.0 or later (`agy acp --login`); with an older one, run `agy` in
-  a terminal once to sign in. Text and tool calls have been verified on 1.4.12
-  and 1.5.0; image input needs 1.5.0.
-- A Magpie build with OpenCode-style provider plugin support. Usage reporting was
-  verified on Magpie 0.1.1599.
-- agy older than 1.4.12 is refused for sessions (see "Tool bridge"), and older
-  than 1.1.11 for usage queries too, because those builds can treat `/usage` as
-  an ordinary model prompt.
-- **Auto-update**: the agy processes the plugin starts get
-  `AGY_CLI_DISABLE_AUTO_UPDATE=true` by default, so the processes in the pool
-  don't update one binary under each other. agy runs you start yourself are not
-  affected and update as usual. If you set `AGY_CLI_DISABLE_AUTO_UPDATE`
-  yourself (`false` included), the plugin passes your value on as written. If
-  you use agy only through this plugin, run `agy` in a terminal now and then so
-  it updates: an old version stands out too. The copy the plugin installed is
-  kept current by the plugin: checked a minute after it starts and every 6
-  hours after, and a new version is downloaded, checked and tried before it
-  replaces the old one. Not when you set `AGY_CLI_DISABLE_AUTO_UPDATE`.
+- The plugin host must run Linux and provide util-linux `script` at
+  `/usr/bin/script`. Clients do not have to run on Linux.
+- The Antigravity CLI (`agy`). The native TUI was verified with agy 1.5.18 in
+  an isolated environment.
+- Magpie 0.1.4246 or later.
 
-## Install
+## Install and use
 
-From the Magpie community plugins: find "Antigravity (local agy CLI)" on
-Magpie's Plugins page and install it, or run:
+Find “Antigravity (local agy CLI)” on Magpie's Plugins page and install it, or run:
 
 ```sh
 magpie plugin add @magpie-community/opencode-agy-cli-auth
 ```
 
-The provider id is `agy-cli`, so models are named `agy-cli/<model>`. The
-default concurrency is 16; change it under Concurrency on Magpie's Providers
-page (0 means no limit).
+If agy is missing, **Sign in** first downloads the release used by Google's
+installer, verifies its SHA-512 and installs it at
+`$XDG_DATA_HOME/magpie-agy-cli/agy` (or `~/.local/share/magpie-agy-cli/agy` by
+default). Your own installation takes priority. The plugin keeps its own copy
+up to date when in use and does not replace one you installed yourself.
 
-After installing, sign in from Magpie; no terminal needed.
+1. Find `agy-cli` on Magpie's Providers page, click **Sign in**, and choose a method:
+   - **Sign in with Google**: Reuse agy's token file or explicitly configured ADC
+     credentials. A sign-in stored only in the system keyring requires a new
+     native sign-in.
+   - **Add another Google account**: Always start a new native sign-in, leaving
+     existing accounts unchanged.
+   - **OAuth configuration authorization login**: Enter the OAuth client,
+     registered redirect URI and scopes, or leave them blank to use agy's defaults.
+   - **Sign in with OAuth tokens**: Enter a Google OAuth refresh token and its
+     client configuration. The plugin checks the refresh grant before saving.
 
-## Usage
+   Starting a new native Google sign-in requires a Linux plugin host and Bun
+   with `Bun.Terminal` support. The plugin selects **Google OAuth** from agy's
+   interactive terminal menu. Open the authorization link shown in Magpie, sign
+   in, then paste either the authorization code or the full callback URL into
+   Magpie. Reusing CLI credentials, configured OAuth and file imports do not
+   need this sign-in terminal.
+2. Select `agy-cli/<model>` in your client. When agy lists different IDs for
+   thinking levels of the same model, Magpie shows them as variants of one model
+   and the plugin maps each request back to the matching agy ID.
 
-1. Open Magpie's Providers page, find `agy-cli`, click Sign in and choose:
-   - **Sign in with Google**: use agy's existing sign-in, or start native
-     `agy acp --login`. Copy the displayed link, open it manually, then paste
-     the authorization code or complete callback URL
-   - **Add another Google account**: always start a new native sign-in,
-     leaving existing accounts unchanged
-   - **OAuth configuration authorization login**: enter `client_id`,
-     `client_secret`, the registered `redirect_uri` and space-separated
-     `scope`. Blank fields use agy's current Google client, callback and
-     scopes; a custom client ID needs its corresponding secret. Open the
-     generated link manually, then paste the code or complete callback URL.
-     A full URL validates the returned state; a bare code is bound to this
-     attempt's PKCE verifier. No local callback listener is started
-   - **Sign in with OAuth tokens**: enter `refresh_token`, its client
-     configuration, and optional `access_token`, `expiry` and `email` as
-     separate fields, with no JSON or account export. Expiry accepts an ISO
-     date or Unix seconds/milliseconds. The refresh grant is always checked
-     before saving, and its fresh tokens replace any supplied access token
+Accounts added through a new sign-in or file import get their own agy homes
+under `~/.local/state/magpie-agy-bridge/accounts/` (or the equivalent under
+`$XDG_STATE_HOME`), leaving your original credentials alone. The plugin uses
+`agy models` to check that the account can list models. Model and quota queries
+use the selected account. For generation, the temporary terminal uses that
+account's token file or configured ADC credentials. Signing in does not make
+an account eligible for a particular model.
 
-   Login never opens a browser automatically. Native login children use
-   [Google's documented SSH flow](https://antigravity.google/docs/install/#remote-ssh-oauth-flow);
-   background execution is unchanged. Links last 15 minutes. Cancellation,
-   failure, expiry or another login releases the unfinished home, process and
-   waits; a repeated callback cannot delete a saved account. New sign-ins
-   get independent agy homes under `~/.local/state/magpie-agy-bridge/accounts/`
-   (or the corresponding `$XDG_STATE_HOME`), without changing original user
-   credentials. An account is saved only after agy lists its models. Usage,
-   model listings and requests all run in that same home. The default client
-   uses native consumer tokens; custom Google clients use agy's native ADC
-   `authorized_user` file, retaining their client configuration and refresh
-   token for CLI-owned renewal. This was checked with isolated fake endpoints
-   on agy 1.5.10. Model eligibility remains agy's and Google's decision.
+Accounts from the retired Antigravity plugin (`antigravity`) can still move
+across with **Move**. **Import accounts from a file…** accepts that plugin's
+sign-in records or agy's `antigravity-oauth-token` file. The plugin adds each
+account only after agy checks it and skips emails already added. Cancelling an
+import only removes unsaved account directories from that batch.
 
-   Accounts from the retired Antigravity plugin (`antigravity`) still move
-   over with Move. Import accounts from a file… takes that plugin's sign-in
-   or agy's `antigravity-oauth-token` file. Each account is checked by agy;
-   tokens are deduplicated, and an existing email is not added again.
-   Cancelling a batch removes its unsaved homes, leaving existing accounts alone.
-2. Refer to models as `agy-cli/<model>`. When agy lists separate model IDs
-   for different thinking levels, they are grouped here as variants of one model,
-   and each request is mapped back to the matching agy ID.
-3. Pick the model in your client as usual.
+## Models and usage quota
 
-## Native TUI
-
-Set `AGY_BRIDGE_MODE=tui` in the plugin host's environment to send eligible
-plain-text requests through agy's interactive terminal on Linux. It requires
-util-linux `script` and was verified with agy 1.5.18. Without the variable the
-plugin uses ACP for all requests.
-
-TUI starts a new session per request, includes text history within the prompt
-budget, and cleans up the process and temporary directory when the turn ends.
-Clients that ask for streaming still receive SSE, but the reply is sent once the
-turn completes. The session uses the selected account's token file or configured
-ADC credentials, not agy's settings from the original home directory. Requests
-with tools, images, structured output or an assistant prefill still use ACP. A
-started TUI turn is not retried through ACP. Sign-in, quota and model discovery
-are unchanged. The terminal may expand tabs to spaces. To return to ACP for all
-requests, remove the environment variable.
-
-## Concurrency
-
-- ACP and TUI share the `AGY_BRIDGE_MAX_PROCS` limit, which defaults to 16 agy
-  processes.
-- Magpie's Providers page has its own Concurrency field that accepts 0 to 1000,
-  where 0 means no limit. A value set there overrides the default of 16 that the
-  plugin declares in `magpie.maxConcurrency`.
-- When the pool is full and no process can be evicted, the plugin answers with
-  HTTP 503. Keep the two numbers aligned: if the Providers page allows more
-  concurrent requests than the pool holds, the extra ones will get 503.
-
-## Platforms
-
-- **macOS and Linux**: supported.
-- **Native Windows**: supported for `.exe`, `.cmd` and `.bat` lookup and launch,
-  silent background update checks, and `magpie quota`. So far only the command
-  construction has unit tests; end-to-end runs on real Windows hardware are still
-  pending.
-
-## Usage quota
+The model catalog comes from `agy models` for each account. The plugin caches
+successful results in `~/.local/state/magpie-agy-bridge/models.json` (or the
+corresponding path under `$XDG_STATE_HOME`). When agy supports `--settings`, the
+plugin passes `{"modelProvider":""}`, so the catalog reflects the Google account
+rather than an AI Studio key from your settings. You can add an AI Studio key
+as Google Gemini on Magpie's Providers page.
 
 ```sh
 magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. Quota reads do not rewrite account
-credentials, send tokens only to Google and use that account's agy home. A window with no
-measurable data shows "Limits not available" rather than a fake 0% or 100%.
+Quota comes from agy's `/usage` report for the selected account and shows
+subscription windows by model group. A window with no measurable data shows
+“Limits not available”, not 0% or 100%. Quota reads do not rewrite credentials.
+The displayed quota is informational and does not preemptively block generation.
 
-Where Antigravity isn't offered, agy refuses `/usage` on its eligibility check
-("not currently available in your location") even though the quota read it
-made had its answer. The plugin then makes that read itself, the way agy makes
-it: with agy's stored sign-in it asks Google's Code Assist server
-(`loadCodeAssist`, then `retrieveUserQuotaSummary`) with agy's own User-Agent.
-An access token about to end is renewed in memory and never stored. If that
-read fails too, the account shows agy's refusal and no numbers.
+If credentials are close to expiry or agy refuses `/usage` because of a region
+restriction, the plugin queries Google directly and renews the access token only
+in memory. If the direct query after a region refusal also fails, Magpie shows
+agy's refusal rather than quota figures. Background queries do not start
+interactive sign-in when no usable sign-in is available. Other quota failures
+back off for 10 minutes at first, doubling up to six hours.
 
-A signed-out agy opens Google's sign-in page in the browser when it runs, so
-before running agy for usage or the model list, the plugin looks at agy's stored
-sign-in in the system keychain (macOS) or Credential Manager (Windows) and only
-reads whether one is there and when it ends. With none, with one that has ended
-and can't be renewed, or with one agy already failed on, agy is not run: the
-account shows its sign-in has expired until you sign in again. Other failed
-usage reads wait 10 minutes before the next try, doubling up to 6 hours.
+## Native TUI
+
+- **Turns and isolation**: Each new user turn starts a temporary agy terminal
+  and replays history within the prompt's byte budget. The terminal uses a
+  separate home and working directory, without loading your usual settings or
+  MCP configuration. The plugin cleans up the process and temporary directory
+  when the turn ends.
+- **Tools**: A private MCP connection forwards agy's native tool calls to the
+  client for execution. agy sends calls one at a time. Each matching
+  `tool_result` continues the same native turn. If a tool returns an image,
+  the plugin starts a new native turn with the actual result and attachment.
+- **Images**: The plugin accepts inline base64 PNG, JPEG and WebP, not GIF or
+  image URLs. agy receives images as clipboard attachments and places them
+  after the text. The plugin marks each original image position by number.
+- **Streaming**: Streaming clients still receive SSE. Tool requests can be sent
+  before the native turn ends, but text and thinking come from completed
+  transcript entries, not token-by-token updates. The terminal may expand tabs
+  to spaces.
+- **Structured output and assistant prefill**: Structured output uses prompt
+  instructions, not a provider-enforced schema. A request ending in a text-only
+  assistant message adds that text to the prompt for continuation rather than
+  setting a native assistant prefix. Prefill submitted with an unanswered tool
+  call or a `tool_result` in the same turn may be rejected.
+
+agy reads text and images only. Text documents (plain text or base64 text, JSON,
+or XML) are sent as text. A URL document is sent as a URL only. PDFs attached
+as input return HTTP 400; paste their text or attach their pages as images
+instead. A PDF in a tool result is turned into a note asking the model to
+extract the text another way.
+
+## Concurrency and timeouts
+
+- The plugin runs up to 16 generation turns at once; set `AGY_BRIDGE_MAX_PROCS`
+  to change this. A turn waiting for a client tool result occupies a slot, and
+  the wait counts towards its timeout.
+- Magpie has a separate **Concurrency** field on its Providers page. It
+  defaults to 16 and accepts 0 to 1000, where 0 means no limit on Magpie's side.
+  The plugin returns HTTP 503 when all its slots are busy. Raising the
+  Providers page setting does not raise the plugin's limit.
 
 ## Environment variables
 
-| Name | Default value | What it does |
+| Name | Default | What it does |
 |---|---|---|
 | `AGY_PATH` | PATH lookup | Path to the agy executable |
-| `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum number of agy processes in the pool |
-| `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries |
-| `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | off | Set to `1` to drop agy's own prompt components; see "Minimal agent" below |
-| `AGY_BRIDGE_TELEMETRY` | off (agy reports nothing) | The bridge starts agy with `--disable-telemetry` when agy's `acp --help` lists it; set to `1` to keep agy's own reporting |
-| `AGY_BRIDGE_SYSTEM_APPEND` | off | Set to `1` to append the client's system prompt to agy's own instead of putting it in the first prompt; see below |
-| `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed; the session can still resume |
-| `AGY_BRIDGE_SPARE` | on | Keeps one spare agy per account, started but with no session and no request sent, so a new conversation skips agy's start; set to `0` to turn it off |
-| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | How long a reclaimed session stays resumable (6 hours) |
-| `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | Where resumable session records are kept |
-| `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | After this long, a still-running client tool gets a "still running" reply |
-| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | Limits for process startup, agy silence, and waiting on a client tool result |
-| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | How long a suspended tool turn whose client disconnected may keep its pool slot |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum number of concurrent generation turns |
+| `AGY_BRIDGE_TURN_TIMEOUT_MS` | 300000 | Total time budget for a native turn in milliseconds, including waiting for tool results |
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
-| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
+| `AGY_BRIDGE_THINKING` | on | Set to `0` to omit `thinking` blocks; to disable for one request, send `thinking: { "type": "disabled" }` |
+| `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
+| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query in milliseconds, capped at 18000 |
 | `AGY_BRIDGE_STORED_SIGNIN` | unset | `skip` stops the plugin from reading agy's stored sign-in |
-| `AGY_BRIDGE_MCP_TRACE` | unset | Writes MCP channel traffic to the given file; for debugging only |
-| `AGY_CLI_DISABLE_AUTO_UPDATE` | `true` for the plugin's agy processes | agy's own variable. When you set it, agy gets your value; see "Requirements" |
-| `AGY_BRIDGE_PREFILL` | on | Set to `0` to restore the stock 400 reject for assistant prefill tails; see "Assistant prefill" |
-| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English system note | The note line rendered before a prefill fragment (sent to the model) |
-
-## Minimal agent (`AGY_BRIDGE_MINIMAL_AGENT=1`)
-
-By default agy runs every request with its own system prompt, and the
-client's system prompt goes as `<external_system_instructions>` at the start
-of the first prompt. Antigravity answers a bare 429 to a growing set of
-agents' prompts appended to agy's own (since 11-15 Claude Code's "You are an
-interactive agent that helps users with software engineering tasks.", even
-as "You're …"), while the same account answers with agy's prompt alone, so
-agy's `systemPrompt.append` is no longer used by default.
-`AGY_BRIDGE_SYSTEM_APPEND=1` goes back to it (in the session, when agy
-advertises it). The cost: the client's system prompt shares the first
-prompt's byte budget with replayed history (`AGY_BRIDGE_MAX_PROMPT_BYTES`),
-and agy's context compaction may summarise it.
-
-Antigravity answers a 429 "Resource has been exhausted" to a few system
-prompt lines whatever quota is left (Claude Code's billing line, the Claude
-Agent SDK, Codex, Hermes Agent, OpenCode and pi identities, oh-my-pi's RFC
-2119 line). The
-plugin leaves the billing line out and rewords the others with the same
-meaning before agy sends them ("built on the Claude Agent SDK by Anthropic",
-"built on GPT-5", "RFC 2119 key words: …", "You're Hermes Agent / OpenCode /
-a coding agent running in the Codex CLI", "running within pi"), as the
-Antigravity provider does (`cloak.mjs`). Codex's two GPT-5 lines
-("You are Codex, a coding agent based on GPT-5", "You are Codex, an agent based on GPT-5")
-are turned away in a user's turn too (AGENTS.md, a `<system-reminder>`),
-so they go as "built on GPT-5" there as well. Zero-width spaces no longer help:
-since 11-14 Google's check reads past them. Should such a 429 still come
-back, it is reported as a 400 about the prompt, not as a quota.
-
-DeepSeek Harness's paragraph on `@` paths ("Tokens prefixed with @ are
-paths…") goes reworded with the same meaning, as the Antigravity provider
-sends it: word for word, it got most `gemini-4-argon` answers fast, without
-thinking and shallow (#1028). DeepSeek Harness's first line, "You are an AI
-agent powered by DeepSeek Harness." (#1171), and "The browser provides no
-implicit DOM, route, or screenshot context." in its Web GUI paragraph
-(#1105) get the 429 as written too, so they go as "You're …" and "The
-browser gives …".
-
-Set to `1`, the temporary agent carries `excludeDefaultComponents: true`. The
-request that goes upstream then has none of agy's own system prompt, only
-the plugin's one-line tool note and the client's system prompt (sent in one
-of the two ways above). The original author measured about 8,400 input
-tokens per model call with agy's prompt and about 500 without. The cost is
-that upstream no longer sees agy's own request shape, which is why it is
-off unless you turn it on.
+| `AGY_BRIDGE_PREFILL` | on | Set to `0` to reject assistant prefill with HTTP 400 |
+| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English note | Override the note sent to the model before the prefill text |
+| `AGY_BRIDGE_MCP_TRACE` | unset | Write MCP traffic to the supplied path for debugging |
+| `AGY_CLI_DISABLE_AUTO_UPDATE` | `true` for the plugin's agy processes | Prevent concurrent generation processes from updating the same binary; a value you set is preserved |
 
 ## Troubleshooting
 
-- **agy cannot be found**: click Sign in in Magpie to have it installed (Magpie
-  0.1.4246 or later), set `AGY_PATH` to the executable, or make sure `agy` is
-  on PATH.
-- **Sign in fails, or agy reports a login problem**: click Sign in again, or run
-  `agy` in a terminal to sign in there.
-- **"You do not have a valid license of this product" (#3501)**: Google refuses
-  this account, and agy in a terminal gets the same answer. The plugin says so
-  in the model list on the Providers page and in the request's HTTP 403, instead
-  of offering the static catalog as if the account had those models. Try:
-  update agy and sign in again (Sign in in Magpie, or run `agy` in a terminal,
-  then /logout and /login); use a personal Google account (@gmail.com) rather
-  than a Workspace one; unset `AGY_ADC_AUTH` if it is set; turn off a VPN or
-  proxy that puts you in a region Antigravity isn't offered in.
-- **HTTP 503**: the pool is full. Raise `AGY_BRIDGE_MAX_PROCS` and the Providers
-  page Concurrency, or reduce the number of simultaneous sessions.
-- **Usage shows "Limits not available" or a version error**: that window has no
-  measurable data. For a version error, upgrade agy to 1.1.11 or later.
-- **Image requests return HTTP 400**: the running agy does not advertise image
-  support (1.5.0 or later is needed). Only inline base64 is accepted; image URLs
-  are rejected.
-- **Documents**: agy reads text and images only. A text document (plain text,
-  base64 text/JSON/XML) goes as its text, and a URL document goes as its URL,
-  for the model to fetch with a tool. A PDF read by a tool reaches the model as
-  a note to extract its text another way; a PDF attached to the message itself
-  gets HTTP 400 saying so. Paste its text or attach its pages as images instead.
-- **A reply contains "Agent execution terminated due to error."**: that is agy's
-  in-band error marker. The plugin reads the real cause from agy's log and ends
-  the turn with an error instead of passing the marker through as text. agy
-  1.5.8's "There was a network issue connecting to the server" and "Your AI
-  credits balance is too low to continue." end the turn the same way (the
-  latter as a rate limit), and its `⚠ API error (attempt N)` retry lines are
-  dropped. So are the three lines agy writes into the reply when its own output
-  cap triggers a retry ("Your previous response was cut off because it exceeded
-  the output token limit", its instruction to continue, and "Retries
-  remaining: N"); the model's continuation after them still reaches the client.
-  An ending that says "This service has been disabled in this account
-  for violation of Terms of Service" is returned as a no-retry
-  `permission_error` with 403 semantics, not as normal reply text. So is the
-  "Verification Required" ending (Google wants the account verified), with
-  the link to verify it at when agy logged one, else where to verify it.
-  The "User location is not supported for the API use." ending keeps Google's
-  wording and returns an `invalid_request_error` (HTTP 400 without streaming),
-  not reply text or an account ban.
-  Google's `UNAUTHENTICATED (code 401)` notice about invalid credentials ends
-  the stream with `authentication_error` instead of reply text, or returns
-  HTTP 401 without streaming. Sign in again with the affected account.
-  The "⚠ Individual quota reached. … Resets in 1h18m40s." ending (the
-  account's own quota is used up) ends the turn as a rate limit
-  (`rate_limit_error`, HTTP 429 without streaming) carrying agy's words and
-  reset, so magpie rests the account until then and asks the next one.
-- **HTTP 409 saying tool results do not match the history**: usually the client
-  rewrote the history or tool IDs mid-conversation. When the plugin can work out
-  the correct match it rebuilds the session; when it cannot, it refuses rather
-  than guessing. Hermes Agent writes one batching `tool_call({"calls": [...]})`
-  into its history as one call per entry; the plugin folds those back into the
-  one call agy made, with one result (#1150).
-- **Turning thought summaries off**: set `AGY_BRIDGE_THINKING=0`, or send
-  `thinking: { "type": "disabled" }` with the request.
+- **agy cannot be found**: Ensure `agy` is on the plugin host's PATH or set
+  `AGY_PATH` to the executable.
+- **The TUI will not start**: Check that the plugin runs on Linux and that
+  `/usr/bin/script` on the host or in the container comes from util-linux.
+- **“You do not have a valid license of this product”**: agy reports that the
+  account is not eligible. Check `agy models` with the same account.
+- **A tool result returns HTTP 409**: Check that the client preserved the
+  original tool call ID and matching history and sent the result before the
+  turn timed out. A completed native turn cannot be resumed.
+- **Usage shows “Limits not available” or a version error**: The first means
+  the window has no measurable data. For a version error, upgrade agy to 1.1.11
+  or later.
 
 ## Development
 
+From the repository root:
+
 ```sh
-bun test packages/agy-cli        # from the repo root
+bun test packages/agy-cli
 bun scripts/check.mjs agy-cli
 ```
-
-The tests run the full ACP and MCP path against a fake agy (an ACP stdio server
-under `test/`), so they never start the real agy and use no quota.
 
 ## License
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import childProcess from "node:child_process"
 import { syncBuiltinESMExports } from "node:module"
 import { test } from "node:test"
-import { agyCandidates, agySpawnSpec, childEnv, spawnAgy, windowsMcpShim } from "../platform.mjs"
+import { agyCandidates, agySpawnSpec, childEnv, spawnAgy, windowsTreeKill } from "../platform.mjs"
 
 test("Windows discovery considers exe/cmd/bat, Path and LOCALAPPDATA", () => {
   const candidates = agyCandidates({ Path: 'C:\\Program Files\\agy;D:\\tools', LOCALAPPDATA: 'C:\\Users\\Test\\AppData\\Local' }, 'C:\\Users\\Test', 'win32')
@@ -15,14 +15,14 @@ test("Windows discovery considers exe/cmd/bat, Path and LOCALAPPDATA", () => {
 test("POSIX discovery and direct executable arguments do not use a shell", () => {
   assert.deepEqual(agyCandidates({ PATH: '/usr/bin:/opt/bin' }, '/home/test', 'linux').slice(0, 2), ['/usr/bin/agy', '/opt/bin/agy'])
   for (const [file, platform] of [['/opt/agy', 'linux'], ['C:\\agy.exe', 'win32'], ['/opt/agy.cmd', 'linux']]) {
-    const args = ['acp', '--add-dir', 'space & percent% quote"']
+    const args = ['models', '--add-dir', 'space & percent% quote"']
     assert.deepEqual(agySpawnSpec(file, args, platform), { file, args, options: {} })
   }
 })
 
 test("Windows batch wrappers use cmd explicitly and escape shell metacharacters", () => {
   for (const extension of ['cmd', 'bat', 'CMD']) {
-    const spec = agySpawnSpec(`C:\\Program Files\\agy.${extension}`, ['acp', '--add-dir', 'C:\\a & b\\%NAME%!\\'], 'win32', { ComSpec: 'C:\\Windows\\System32\\cmd.exe' })
+    const spec = agySpawnSpec(`C:\\Program Files\\agy.${extension}`, ['models', '--add-dir', 'C:\\a & b\\%NAME%!\\'], 'win32', { ComSpec: 'C:\\Windows\\System32\\cmd.exe' })
     assert.equal(spec.file, 'C:\\Windows\\System32\\cmd.exe')
     assert.deepEqual(spec.args.slice(0, 4), ['/d', '/v:off', '/s', '/c'])
     assert.equal(spec.options.windowsVerbatimArguments, true)
@@ -41,10 +41,11 @@ test("batch invocation rejects command line breaks", () => {
   }
 })
 
-test("nc.cmd quotes paths, escapes percent expansion and disables delayed expansion", () => {
-  const script = windowsMcpShim('C:\\Program Files\\node.exe', 'C:\\user%name%!\\mcp-server.mjs')
-  assert.equal(script, '@echo off\r\nsetlocal DisableDelayedExpansion\r\n"C:\\Program Files\\node.exe" "C:\\user%%name%%!\\mcp-server.mjs"\r\n')
-  assert.throws(() => windowsMcpShim('node.exe', 'bad"path'), /invalid Windows MCP shim path/)
+test("Windows child cleanup terminates each distinct process tree in one command", () => {
+  assert.deepEqual(windowsTreeKill([12, 34, 12, 0, undefined, -1]), {
+    file: "taskkill", args: ["/T", "/F", "/PID", "12", "/PID", "34"],
+  })
+  assert.equal(windowsTreeKill([undefined]), null)
 })
 
 test("npm cmd-shims escape metacharacters for the second expansion pass", () => {
@@ -130,7 +131,7 @@ for (const extension of ["cmd", "bat"]) {
     const parent = Object.freeze({ ComSpec: "C:\\Windows\\System32\\cmd.exe", AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
     captureSpawn("win32", parent, calls => {
       const file = `C:\\Program Files\\Antigravity & Tools\\agy.${extension}`
-      const args = ["acp", "--add-dir", "C:\\space & percent% !\\"]
+      const args = ["models", "--add-dir", "C:\\space & percent% !\\"]
       const expected = agySpawnSpec(file, args, "win32", parent)
       spawnAgy(file, args, { windowsHide: false, windowsVerbatimArguments: false, env: { AGY_CLI_DISABLE_AUTO_UPDATE: "false" } })
       assert.equal(calls[0].file, expected.file)

@@ -1,307 +1,115 @@
 # agy-cli
 
-把本机的 Antigravity CLI（`agy`）接成 Magpie 里的一个模型 provider。装好以后，
-OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放的模型，请求实际由
-`agy` 进程完成。
+把本机的 Antigravity CLI（`agy`）接成 Magpie 里的一个模型 provider。OpenCode、Claude Code
+等客户端经由 Magpie 发送 Anthropic Messages 请求；插件启动 `agy` 的原生交互终端（TUI）生成回复。
+模型能否使用由 agy 和 Google 决定。
 
 **[English → README.en.md](README.en.md)** ｜ 来源、版权与迁移说明见 [NOTICE.md](NOTICE.md)
 
-## 这是什么
-
-插件以 Magpie provider 的形式运行。客户端发来 Anthropic Messages 格式的请求。默认由插件翻译成 ACP（Agent Client Protocol）消息，
-交给本机的 `agy acp` 进程，再把输出转回流式响应。Linux 也可选择[原生 TUI](#原生-tui)，
-让符合条件的文本请求走 `agy` 的交互入口。
-
-- 底层是真正的 agy CLI，走它自带的 ACP 通道。ACP 握手里的 `clientInfo` 是本插件自己的
-  包名和版本（`opencode-agy-cli-auth`），不冒充 Zed 或其它编辑器。插件在配置 OAuth 登录时完成
-  Google 授权交换与账号验证；agy 因地区拒绝 `/usage` 时，也按 agy 的方式读额度（见「额度」）。
-- 客户端自己的工具（读写文件、执行命令等）通过 MCP 暴露给模型。工具由客户端执行，结果
-  回传到同一轮 agy 对话里，模型看到的是原生工具调用。
-- 账号风险不由插件决定。Google 的使用政策变化时，插件无法替你保证账号不受限制。
-
-## 与 Antigravity ACP 的区别
-
-社区里的 Antigravity ACP（`antigravity-acp`）走的是同一个渠道：Antigravity 的模型经由 ACP。
-两者的区别：
-
-- **运行的程序**：Antigravity ACP 自己下载 Google 的 ACP 服务端（`agy_acp_server.par`，
-  约 400 MB），依赖 Antigravity IDE 的登录。本插件运行 `agy` CLI（`agy acp`）：用你自己装好的；
-  机器上没有时，在 Magpie 里登录会按 Google 官方安装脚本的方式装一份（见「环境要求」）。
-- **会话**：Antigravity ACP 每个请求开一个新会话，把历史当作上下文带上。本插件维护一个
-  agy 进程池，同一段对话复用同一个 agy 会话，重启后用 `session/resume` 接上；只有接不上时
-  才在字节预算内重放历史。
-- **工具调用**：Antigravity ACP 把工具调用作为回复的 `tool_calls` 结束这一轮。本插件把
-  客户端的结果送回同一轮 agy 对话（见下文「工具桥接」）。
-- **额度**：本插件读 agy 自己的 `/usage` 报告；Antigravity ACP 读每次回复带的配额。
-
-## 工具桥接
-
-agy 连接 `--ide-mcp-port` 时会运行 `nc 127.0.0.1 <端口>`。插件在 agy 的 PATH 最前面放一个
-私有的 `nc`，它把这条连接接到插件自己的 MCP 服务上；控制端口只监听本机回环地址，每个进程
-有自己的令牌。
-
-- 这依赖 agy 拨号的方式，不是 agy 公开承诺的接口，已在 1.4.12 和 1.5.0 上验证。agy 低于
-  1.4.12 时，插件会直接报错并提示升级。
-- 这个 `nc` 只对插件启动的 agy 进程生效，但对这些进程来说，它替换了 agy 运行的所有 `nc`。
-- 客户端的每个工具都带 `_meta: {"antigravity/alwaysLoad": true}` 列出。不带的话，agy 会把较大的工具改为按需加载，不放进模型的函数列表，模型就用不到它们（#989）。
-- 模型一次请求多个工具时，agy 也是一个一个发出的：每个桥接工具调用前，agy 都会先跑一遍自己的安全检查（`sir_flash_lite`，约 1.3–2.6 秒），等上一个工具的结果回来才发下一个。所以客户端看到的是一连串只带一个 `tool_use` 的回复（用量里记成 0 token 的请求），每多一个工具多等约 2 秒。这是 agy 自己的行为，插件这边没有开关能改；插件也不会把工具改成 agy 内置工具的名字来绕过这个检查（#1193）。
-
-## 功能
-
-- **agy 开放的模型**：模型列表以 ACP 会话里 agy 给出的模型选项为准。`agy models` 列出的
-  模型如果没有在会话里向本客户端开放（agy 可能只向它认可的客户端开放 Claude、GPT-OSS），
-  就不会出现在列表里。列模型时插件会先用 `agy acp` 开一个会话（不发 prompt）问 agy 开放了哪些，
-  问到之前只列 Gemini。上次 agy 列出并开放的模型存在会话状态文件旁边的 `models.json`，
-  重启后先列它，同时再问一次 agy。模型和思考等级可以在会话中切换，
-  历史保留。`agy models` 带 `--settings '{"modelProvider":""}'` 运行，所以
-  settings.json 里的 `"modelProvider": "gemini"`（AI Studio 密钥）不影响这里的列表，
-  列出的是 Google 账号的模型；AI Studio 密钥请在 Magpie 的 Providers 页加成 Google Gemini。
-- **流式输出与思考摘要**：思考摘要以 `thinking` 块返回，设置 `AGY_BRIDGE_THINKING=0` 可关闭。
-- **图片输入**：支持内联 base64 的 PNG、JPEG、GIF、WebP。需要 agy 1.5.0 或更新版本，
-  因为图片能力要由 ACP 服务端声明。工具返回的图片（如 `read` 读到的截图）也作为提示里的
-  图片交给 agy：走 MCP 的话，agy 会把它存成文件，模型看不到。
-- **工具调用**：支持并行和连续调用。运行超过 150 秒的工具会先收到 "still running" 的
-  占位响应，真正的结果送达后继续同一轮对话，每个调用只在客户端执行一次。
-- **会话续接**：每轮结束后记录会话。重启 Magpie 或插件后，只要历史和指令的哈希一致，
-  就用 `session/resume` 接上上下文。状态文件只存会话 ID 与哈希，不存消息原文。
-- **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 为它自己的
-  工具发起的权限请求（shell、写文件、浏览器等）一律拒绝；客户端工具经桥接的 `ide-tools`
-  调用时发起的请求放行一次，这些工具在客户端里运行，受客户端自己的权限管。真正的操作
-  都在客户端侧完成。
-- **助手预填**：以 assistant 结尾的预填请求（SillyTavern 预设、继续写、bot 框架）不再
-  400 拒绝：预填留在本轮并渲染为续写载体，会话跨轮保持对齐，见下文「助手预填」。
-- **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
-
-## 助手预填（assistant prefill）
-
-客户端的请求以一条**纯文本 assistant 消息**结尾时（SillyTavern 预设的预填、
-「继续写 / Impersonate」、bot 框架的拼装），旧版会直接 400 拒绝。现在这段
-预填被当作本轮的一部分：
-
-- 预填留在本轮尾部，会话账本（expectedMessages，客户端原字节）与客户端自己
-  的历史跨轮对齐——预填轮之后会话照常复用，不再整段重放；
-- 预填文本渲染为一条续写载体（提示行 + 原文），发给 agy 让模型从停下的地方
-  接着写；
-- `AGY_BRIDGE_PREFILL=0` 恢复原来的 400 拒绝；`AGY_BRIDGE_PREFILL_CARRIER_NOTE`
-  自定义载体提示行。
-
-已知限制：与 live tool_result 共存的预填、以及未应答 tool_use 后紧跟的预填仍被 400 拒绝；前面没有 user 消息的
-连续 assistant 尾整段视为预填（该轮降级为新会话，下一轮自愈）；向客户端开放
-哪些模型仍由 agy 决定。
-
 ## 环境要求
 
-- Antigravity CLI（`agy`），带 `acp` 子命令。机器上没有 agy 时（比如 Magpie 的 Docker 容器里），
-  Magpie 0.1.4246 起在 Magpie 里点 Sign in 会先装好它：从 Google 官方安装脚本用的同一个地址下载、
-  校验 sha512，放在数据目录里（`$XDG_DATA_HOME/magpie-agy-cli/agy`，没设时是
-  `~/.local/share/magpie-agy-cli/agy`；Windows 是 `%LOCALAPPDATA%\magpie-agy-cli\agy.exe`）。
-  容器的数据目录在 /config 卷里，重启后还在。你自己装的 agy 优先。在 Magpie 里登录需要 1.5.0 起的 agy（`agy acp --login`）；更早的版本请先在终端运行一次 `agy` 登录。
-  文本与工具调用已在 1.4.12 和 1.5.0 上验证；图片输入需要 1.5.0。
-- 支持 OpenCode 风格 provider 插件的 Magpie。额度查询已在 Magpie 0.1.1599 上验证。
-- agy 版本低于 1.4.12 时，会话会被拒绝（见「工具桥接」）；低于 1.1.11 时，额度查询也会被
-  拒绝，以免旧版本把 `/usage` 当成模型提示词。
-- **自动更新**：插件启动的 agy 进程默认带 `AGY_CLI_DISABLE_AUTO_UPDATE=true`，免得进程池里的
-  多个进程同时更新同一个可执行文件。你自己在终端里运行的 agy 不受影响，照常更新。你自己设置了
-  `AGY_CLI_DISABLE_AUTO_UPDATE`（包括设为 `false`）时，插件原样使用你的值。只通过本插件使用
-  agy 的话，请定期在终端里运行一次 `agy` 让它更新：版本过旧本身也更显眼。插件自己装的那份由插件
-  保持最新：启动一分钟后查一次，之后每 6 小时查一次，有新版就下载、校验、试运行后替换；你设置了
-  `AGY_CLI_DISABLE_AUTO_UPDATE` 时不更新。
+- 运行插件的主机必须是 Linux，并在 `/usr/bin/script` 提供 util-linux 版 `script`。客户端不受这个平台限制。
+- 需要 Antigravity CLI（`agy`）；原生 TUI 已用 agy 1.5.18 在隔离环境验证。
+- 需要 Magpie 0.1.4246 或更新版本。
 
-## 安装
+## 安装与使用
 
-从 Magpie 社区插件市场安装（推荐）：在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
+在 Magpie 的 Plugins 页找到「Antigravity (local agy CLI)」点安装，或在终端运行：
 
 ```sh
 magpie plugin add @magpie-community/opencode-agy-cli-auth
 ```
 
-装好后 provider id 是 `agy-cli`，模型写成 `agy-cli/<模型>`。默认并发 16，可在 Magpie 的 Providers 页 Concurrency 里改（0 表示不限）。
+如果还没安装 agy，Magpie 的 **Sign in** 会先下载 Google 官方安装脚本使用的发行包，校验
+SHA-512 后安装到 `$XDG_DATA_HOME/magpie-agy-cli/agy`（默认 `~/.local/share/magpie-agy-cli/agy`）。
+已有的 agy 优先使用。插件只更新自己安装且正在使用的副本，不会替换你自行安装的 agy。
 
-安装完成后在 Magpie 里登录即可，不需要先开终端。
+1. 在 Magpie 的 Providers 页找到 `agy-cli`，点 **Sign in** 并选择登录方式：
+   - **使用 Google 登录**：复用 agy CLI 已有的文件令牌或显式配置的 ADC 凭据。仅存于系统钥匙环的登录不能复用，插件会发起新的原生登录。
+   - **添加另一个 Google 账号**：始终发起新的原生登录，不改已有账号。
+   - **OAuth 配置授权登录**：按表单填写 OAuth 客户端、已注册的回调地址和权限范围，
+     或留空使用 agy 的默认配置。
+   - **填写 OAuth Token 登录**：填入 Google OAuth 刷新令牌及对应的客户端配置，插件会在保存前检查令牌能否刷新。
 
-## 使用
+   发起新的原生 Google 登录时，插件主机须运行 Linux，且插件所用的 Bun 须支持 `Bun.Terminal`。
+   插件在 agy 的交互终端菜单中选择 **Google OAuth**；手动打开 Magpie 显示的授权链接，登录后把
+   授权码或完整回调 URL 粘贴回 Magpie。复用已有 CLI 凭据、配置式 OAuth 和文件导入不需要启动这个登录终端。
+2. 在客户端选用 `agy-cli/<模型>`。agy 为同一模型的不同思考等级提供多个 ID 时，Magpie 将它们
+   显示为一个模型的多个变体，请求时再映射到对应的 agy ID。
 
-1. 在 Magpie 的 Providers 页找到 `agy-cli` 并点击 Sign in，选择登录方式：
-   - **使用 Google 登录**：agy 已登录时直接使用现有账号；否则运行原生 `agy acp --login`，
-     从提示中复制链接、手动打开，登录后粘贴授权码或完整回调 URL
-   - **添加另一个 Google 账号**：始终开始一次新的原生登录，已有账号保持不变
-   - **OAuth 配置授权登录**：按表单填写 `client_id`、`client_secret`、已注册的 `redirect_uri`
-     和空格分隔的 `scope`；留空使用现行 agy Google 客户端及其默认回调、权限。自定义
-     `client_id` 需同时填写对应的 `client_secret`。手动打开生成的链接，再粘贴授权码或完整
-     回调 URL；完整 URL 会校验返回的 state，授权码绑定本次 PKCE verifier，不启动本地监听
-   - **填写 OAuth Token 登录**：单独填写 `refresh_token`、对应的客户端配置，以及可选的
-     `access_token`、`expiry`、`email`，不需要 JSON 或账号导出。`expiry` 接受 ISO 日期或 Unix
-     秒/毫秒；保存前始终执行 refresh grant，使用返回的新令牌，确认该客户端能持续续期
+通过新登录或文件导入添加的账号使用 `~/.local/state/magpie-agy-bridge/accounts/`（或
+`$XDG_STATE_HOME` 对应位置）下独立的 agy 主目录，不改用户原有凭据。插件用 `agy models`
+验证账号能否列出模型。模型和额度查询使用所选账号；生成时，临时终端使用该账号的文件令牌
+或已配置的 ADC 凭据。登录成功不代表账号具备某个模型的资格。
 
-   登录不会自动打开浏览器。[Google 官方 SSH 登录流程](https://antigravity.google/docs/install/#remote-ssh-oauth-flow)
-   用于原生登录子进程，后台运行方式不变。链接有效期为 15 分钟；取消、失败、过期或开始新登录
-   会释放未完成账号的目录、进程和等待，重复回调不会删除已保存账号。每个新登录账号使用
-   `~/.local/state/magpie-agy-bridge/accounts/`（或 `$XDG_STATE_HOME` 对应位置）下独立的 agy
-   主目录，不改用户原有凭据；agy 列出账号模型后才保存。每个账号的用量、模型和请求使用同一个 home。
-   默认客户端使用原生 consumer token 文件；自定义 Google 客户端通过 agy 原生 ADC
-   `authorized_user` 文件保存 client 与 refresh token，并由 CLI 续期，已在 agy 1.5.10 的隔离
-   假端点上验证。模型订阅资格仍由 agy 和 Google 判定，不把登录成功当成模型可用。
+已退役 Antigravity 插件（`antigravity`）的账号仍可用 **Move** 迁入。
+**Import accounts from a file…** 接受该插件的登录记录或 agy 的 `antigravity-oauth-token` 文件。
+账号通过 agy 检查后才加入；已有邮箱不会重复添加。取消导入只清理本批未保存的账号目录。
 
-   已退役 Antigravity 插件（`antigravity`）的账号仍可点 Move 迁入；Import accounts from a file…
-   接受那份登录记录或 agy 的 `antigravity-oauth-token` 文件。每个账号由 agy 检查后才加入，
-   相同令牌只检查一次，已有邮箱不会重复添加；取消整批导入会删除本批未保存目录，保留已有账号。
-2. 模型名写成 `agy-cli/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
-   在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
-3. 在客户端里选用这个模型即可。
+## 模型与额度
 
-## 原生 TUI
-
-在运行插件的进程环境中设置 `AGY_BRIDGE_MODE=tui`，Linux 上符合条件的纯文本请求就会进入
-`agy` 的交互终端。需要 util-linux 提供的 `script`，已用 agy 1.5.18 验证。不设置变量时仍全部走 ACP。
-
-TUI 每个请求新开一个会话，按提示词预算带上文本历史，回合完成后读出回复并清理进程及临时目录。
-流式客户端仍收到 SSE，但正文在回合完成后一次发出。会话只携带所选账号的文件令牌或已配置的
-ADC 凭据，不加载原 HOME 的 agy 设置。带工具、图片、结构化输出或助手预填的请求仍走 ACP；
-已经开始的 TUI 请求失败时不会再经 ACP 发一遍。模型列表、登录和用量查询沿用现有路径。
-原生终端可能把制表符展开为空格。若要恢复全部走 ACP，移除该环境变量。
-
-## 并发
-
-- ACP 和 TUI 共用 `AGY_BRIDGE_MAX_PROCS` 上限，默认 16 个 agy 进程。
-- Magpie 的 Providers 页有单独的 Concurrency 设置，可填 0–1000，0 表示不限制。
-  你在页面里改的值会覆盖 `package.json` 里 `magpie.maxConcurrency` 的默认声明（16）。
-- 进程池已满、又找不到可以淘汰的进程时，插件返回 HTTP 503。建议两处数值保持一致：
-  Providers 页的并发数超过进程池上限，多出来的请求就会得到 503。
-
-## 平台
-
-- **macOS、Linux**：支持。
-- **原生 Windows**：支持 `.exe`、`.cmd`、`.bat` 的查找与启动，后台更新检查不弹控制台窗口，
-  并支持 `magpie quota`。目前只有命令构造的单元测试，尚未在 Windows 实机完成端到端验证。
-
-## 额度
+模型目录来自各账号的 `agy models`。成功列出的目录缓存在
+`~/.local/state/magpie-agy-bridge/models.json`（或 `$XDG_STATE_HOME` 对应位置）。agy 支持
+`--settings` 时，插件传入 `{"modelProvider":""}`，按 Google 账号列出模型，不沿用用户设置里的
+AI Studio 密钥。AI Studio 密钥可以在 Magpie 的 Providers 页作为 Google Gemini 添加。
 
 ```sh
 magpie quota agy-cli --json
 magpie quota refresh agy-cli --json
 ```
 
-额度数据来自 agy 自己的 `/usage` 报告，显示的是当前 agy 登录账号的订阅窗口，按模型组
-分别列出。额度读取不改写账号凭据，令牌只发往 Google，查询使用该账号的 agy home。没有可测量数据的窗口会显示
-"Limits not available"，而不是 0% 或 100%。
+额度数据来自所选账号的 agy `/usage` 报告，按模型组列出订阅窗口。没有可测量数据的窗口显示 “Limits not available”，而不是 0% 或 100%。额度查询不改写凭据；查询结果仅供查看，不会主动拦截生成请求。
 
-在 Antigravity 未开放的地区，agy 会在资格检查时拒绝 `/usage`（"not currently available in
-your location"），尽管它自己查的额度已经拿到了。这时插件按 agy 的方式自己查：用 agy 存的登录，
-以 agy 的 User-Agent 依次请求 Google Code Assist 的 `loadCodeAssist` 和
-`retrieveUserQuotaSummary`。快到期的访问令牌只在内存里续期，不写回。这次查询也失败时，账号显示
-agy 的拒绝原因，不显示数字。
+登录令牌临近过期或 agy 因地区限制拒绝 `/usage` 时，插件直接向 Google 查询配额，并只在内存中续期访问令牌。地区限制导致的查询再次失败时，显示 agy 的拒绝原因，不显示数字。没有可用登录态时，后台查询不会启动交互登录。其他额度查询失败后从 10 分钟起退避，每次翻倍，最长 6 小时。
 
-未登录的 agy 一运行就会在浏览器里打开 Google 登录页，所以插件在为额度或模型列表运行 agy 之前，
-先看系统钥匙串（macOS）或凭据管理器（Windows）里 agy 存的登录，只读有没有、何时到期。没有登录、
-登录已过期且无法续期、或 agy 已在这份登录上失败过时，不运行 agy，账号显示登录已过期，直到重新登录。
-其他失败的额度查询等 10 分钟再试，每次翻倍，最长 6 小时。
+## 原生 TUI
+
+- **回合与隔离**：每个新用户回合启动一个临时 agy 终端，在提示词字节预算内重放历史。终端使用独立主目录和工作目录，不加载原主目录的设置和 MCP 配置。回合结束后清理进程及临时目录。
+- **工具**：插件通过私有 MCP 连接把 agy 的原生调用转给客户端执行。agy 逐个发出调用；每次收到匹配的 `tool_result`，原生回合继续。工具结果包含图片时，插件会将实际结果和图片放进一个新的原生回合。
+- **图片**：接受内联 base64 的 PNG、JPEG 和 WebP，不接受 GIF 或图片 URL。agy 通过剪贴板入口接收附件，将其放在整段文字后；插件在图片原位置加上序号。
+- **流式输出**：客户端请求流式输出时仍收到 SSE。工具请求可以在原生回合结束前发送，但正文和思考来自已完成的转录条目，不是逐 token 推送。终端可能把制表符展开成空格。
+- **结构化输出与助手预填**：结构化输出采用提示词指令，上游不强制校验 schema。请求以纯文本 assistant 消息结尾时，插件把文本加到提示词末尾，请模型接着写，不是原生 assistant 前缀。与未应答工具调用或同轮 `tool_result` 一起提交的预填可能被拒绝。
+
+agy 只读文字和图片。文本文档（纯文本或 base64 的文本、JSON、XML）按文字发送；URL 文档只发送网址。直接附上的 PDF 返回 HTTP 400，请改为粘贴文字或把页面作为图片附上。工具结果中的 PDF 会转成提示，请模型另行提取文字。
+
+## 并发与超时
+
+- 插件最多同时运行 16 个生成回合，可用 `AGY_BRIDGE_MAX_PROCS` 调整。等待工具结果的回合占用一个名额，等待时间计入回合超时。
+- Magpie 的 Providers 页有单独的 **Concurrency** 设置，默认 16，可填 0–1000，0 表示不限制 Magpie 的并发。插件没有空余名额时返回 HTTP 503；提高页面并发不会提高插件上限。
 
 ## 环境变量
 
 | 变量 | 默认值 | 作用 |
 |---|---|---|
 | `AGY_PATH` | 按 PATH 查找 | 指定 agy 可执行文件 |
-| `AGY_BRIDGE_MAX_PROCS` | 16 | agy 进程池上限 |
-| `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
-| `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件，见下文「精简 agent」 |
-| `AGY_BRIDGE_TELEMETRY` | 关闭（agy 不上报） | 插件启动 agy 时带上 `--disable-telemetry`（agy 的 `acp --help` 没这个开关就带不上）；设成 `1` 保留 agy 自己的上报 |
-| `AGY_BRIDGE_SYSTEM_APPEND` | 关闭 | 设为 `1` 把客户端的系统提示词附加到 agy 自己的系统提示词后面，而不是放进第一条提示词，见下文 |
-| `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
-| `AGY_BRIDGE_SPARE` | 开启 | 每个账号预先启动一个备用 agy（只启动、不建会话，不发任何请求），新对话直接用它，省掉 agy 的启动时间；设为 `0` 关闭 |
-| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | 回收后的会话可续接的时长（6 小时） |
-| `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | 会话状态文件路径 |
-| `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | 工具运行超过该时间仍未结束时，先返回 "still running" |
-| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 秒 / 5 分钟 / 30 分钟 | 进程启动、agy 无输出、等待客户端工具结果的超时 |
-| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | 客户端已断开的挂起工具回合，最多占用进程池槽位这么久 |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | 同时运行的生成回合上限 |
+| `AGY_BRIDGE_TURN_TIMEOUT_MS` | 300000 | 整个原生回合的时间预算（毫秒），包括等待工具结果 |
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688（112 KiB） | 重放历史提示词的字节预算 |
-| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
+| `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 不返回 `thinking` 块；单次请求也可指定 `thinking: { "type": "disabled" }` |
+| `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算（毫秒），最高 18000 |
 | `AGY_BRIDGE_STORED_SIGNIN` | 未设置 | 设为 `skip` 时插件不读 agy 存的登录 |
-| `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
-| `AGY_CLI_DISABLE_AUTO_UPDATE` | 插件启动的 agy 设为 `true` | agy 自己的变量。你设置了就原样传给 agy，见「环境要求」 |
-| `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 恢复对 assistant 预填尾巴的原生 400 拒绝，见「助手预填」 |
-| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文系统提示行 | 预填片段渲染时的提示行文本（发给模型） |
-
-## 精简 agent（`AGY_BRIDGE_MINIMAL_AGENT=1`）
-
-默认情况下，agy 用它自己的系统提示词跑每个请求，客户端的系统提示词作为
-`<external_system_instructions>` 放在第一条提示词开头。Antigravity 对附加在 agy 系统提示词
-后面的越来越多 agent 的提示词直接回 429（11-15 起包括 Claude Code 的 "You are an interactive
-agent that helps users with software engineering tasks."，改成 "You're …" 也一样），只用 agy
-自己的提示词时同一个账号能正常回答，所以默认不再用 agy 的 `systemPrompt.append`。设
-`AGY_BRIDGE_SYSTEM_APPEND=1` 恢复以前的做法（agy 声明支持时附加到会话）。代价：客户端的系统
-提示词和重放的历史共用第一条提示词的字节预算（`AGY_BRIDGE_MAX_PROMPT_BYTES`），agy 压缩上下文时
-它也可能被概括掉。
-
-Antigravity 对几行系统提示词（Claude Code 的计费行、Claude Agent SDK、Codex、Hermes Agent、OpenCode
-和 pi 的身份句、oh-my-pi 的 RFC 2119 行）不论余量多少都回 429 "Resource has been exhausted"。插件在
-agy 发出之前去掉计费那一行，其余几行换成同义的说法（"built on the Claude Agent SDK by Anthropic"、"built on GPT-5"、"RFC 2119 key words: …"、"You're Hermes Agent / OpenCode / a coding agent running in the Codex CLI"、"running within pi"），和 Antigravity 提供商的做法一样（`cloak.mjs`）。Codex 的两句 GPT-5 行（"You are Codex, a coding agent based on GPT-5"、"You are Codex, an agent based on GPT-5"）出现在用户的轮次里（AGENTS.md、`<system-reminder>`）也会被拒，所以用户轮次里也换成 "built on GPT-5"。零宽空格已经没用：11-14 起 Google 的检查会忽略它们。如果仍然
-回了这样的 429，会报成针对提示词的 400，而不是额度用完。
-
-DeepSeek Harness 的 `@` 路径说明段（"Tokens prefixed with @ are paths…"）也和 Antigravity 提供商一样
-换成同义的说法再发：原文照发时 `gemini-4-argon` 大多很快答完、不思考、只走一步（#1028）。
-DeepSeek Harness 的第一句 "You are an AI agent powered by DeepSeek Harness."（#1171）和它 Web GUI 段里的
-"The browser provides no implicit DOM, route, or screenshot context."（#1105）原样发出也会被回 429，
-分别改成 "You're …" 和 "The browser gives …" 再发。
-
-设为 `1` 后，临时 agent 带上 `excludeDefaultComponents: true`：发往上游的请求里不再有
-agy 自己的系统提示词，只剩插件的一行工具说明和客户端的系统提示词（同样以上面两种方式之一
-发送）。原作者实测每次模型调用的输入从约 8,400 token 降到约 500 token。代价是上游看到的
-不再是 agy 自己的请求形态，所以默认关闭，由你自行决定是否开启。
+| `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 时拒绝助手预填并返回 HTTP 400 |
+| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文提示行 | 自定义预填文本前发给模型的提示行 |
+| `AGY_BRIDGE_MCP_TRACE` | 未设置 | 将 MCP 通道流量写入指定文件，仅用于排查 |
+| `AGY_CLI_DISABLE_AUTO_UPDATE` | 插件启动的 agy 默认设为 `true` | 避免生成进程并发更新同一个可执行文件；用户已设置时保留该值 |
 
 ## 常见排查
 
-- **找不到 agy**：在 Magpie 里点 Sign in 让它装一份（需要 Magpie 0.1.4246 起），或设置 `AGY_PATH`
-  指向可执行文件，或确认 `agy` 在 PATH 里。
-- **Sign in 失败或 agy 报登录相关错误**：再点一次 Sign in 重新登录，或在终端运行一次 `agy` 登录。
-- **"You do not have a valid license of this product" (#3501)**：这是 Google 拒绝了这个账号，
-  终端里的 agy 本身也会这样答。插件会在 Providers 页的模型列表和请求的 HTTP 403 里写明这个原因，
-  不再拿静态目录冒充账号的型号。可以试：升级 agy 后重新登录（Magpie 里点 Sign in，或终端运行
-  `agy` 后 /logout 再 /login）；用个人 Google 账号（@gmail.com）而不是 Workspace 账号；如设置了
-  `AGY_ADC_AUTH` 就去掉；关掉把你放到 Antigravity 未开放地区的 VPN 或代理。
-- **HTTP 503**：进程池满。提高 `AGY_BRIDGE_MAX_PROCS` 和 Providers 页的 Concurrency，
-  或者减少同时进行的会话。
-- **额度显示 "Limits not available" 或报版本错误**：该窗口没有可测量的数据；版本错误则
-  把 agy 升级到 1.1.11 以上。
-- **图片请求返回 HTTP 400**：当前 agy 没有声明图片能力（需要 1.5.0 以上）。另外只接受
-  内联 base64，URL 图片会被拒绝。
-- **文档**：agy 只读文字和图片。文本文档（纯文本，或 base64 的文本/JSON/XML）按文字发过去；
-  URL 文档发的是网址，由模型用工具去取。工具读到的 PDF 会变成一条说明，提示模型换个方式
-  提取文字；直接附在消息里的 PDF 返回 HTTP 400 并说明原因，请改为粘贴文字或把页面作为图片附上。
-- **回复里出现 "Agent execution terminated due to error."**：这是 agy 的错误标记。插件会
-  从 agy 的日志中取出真实原因，并以错误结束本轮，不会当作正常回复输出。agy 1.5.8 的
-  "There was a network issue connecting to the server" 和 "Your AI credits balance is
-  too low to continue." 也一样（后者按额度不足报错）；`⚠ API error (attempt N)` 这类
-  重试中的提示行会被去掉。agy 自己撞上输出上限后重试时，也会把三行提示写进正文
-  （"Your previous response was cut off because it exceeded the output token limit"、
-  它的续写指令和 "Retries remaining: N"），这三行同样会被去掉，后面模型的续写照常
-  输出。若结尾是 "This service has been disabled in this account for
-  violation of Terms of Service"，会按禁止重试的 403 语义 `permission_error` 返回，而不是
-  当成正常正文。结尾是 "Verification Required"（Google 要求先验证这个账号）时也一样，
-  并带上 agy 记下的验证链接；没有链接时说明去哪里验证。
-  结尾是 "User location is not supported for the API use." 时，保留地区拒绝原文，
-  按 `invalid_request_error` 结束本轮，非流式为 HTTP 400，不当成正常回复或账号封禁。
-  Google 的 `UNAUTHENTICATED (code 401)` 凭据错误提示也不写入正文：流式以
-  `authentication_error` 结束，非流式返回 HTTP 401。请重新登录报错的账号。
-  结尾是 "⚠ Individual quota reached. … Resets in 1h18m40s."（这个账号自己的额度用完）时，
-  按额度不足（`rate_limit_error`，非流式为 HTTP 429）结束本轮，原文和重置时间一并带上，
-  magpie 据此让这个账号歇到重置，并改问下一个账号。
-- **HTTP 409，提示工具结果与历史对不上**：通常是客户端在对话中途改写了历史或工具 ID。
-  能确定对应关系时插件会重建会话；无法确定时直接拒绝，不做猜测。
-  Hermes Agent 会把一次批量的 `tool_call({"calls": [...]})` 在自己的历史里拆成每项一次调用，
-  插件会把它合回 agy 发出的那一次调用、那一份结果（#1150）。
-- **想关掉思考摘要**：设置 `AGY_BRIDGE_THINKING=0`，或者在请求里带上
-  `thinking: { "type": "disabled" }`。
+- **找不到 agy**：确认 `agy` 在插件主机的 PATH 里，或将 `AGY_PATH` 指向可执行文件。
+- **无法启动 TUI**：确认插件运行在 Linux 上，且容器或主机的 `/usr/bin/script` 来自 util-linux。
+- **“You do not have a valid license of this product”**：这是 agy 报告的账号资格拒绝。用相同账号核对 `agy models` 的结果。
+- **工具结果返回 HTTP 409**：确认客户端保留了原始工具调用 ID 及对应历史，并在回合超时前送回结果；已结束的原生回合不能续接。
+- **额度显示 “Limits not available” 或报版本错误**：前者表示该窗口没有可测量数据；报告版本过低时请将 agy 更新至 1.1.11 或以上。
 
 ## 开发
 
+在仓库根目录运行：
+
 ```sh
-bun test packages/agy-cli        # 在仓库根目录
+bun test packages/agy-cli
 bun scripts/check.mjs agy-cli
 ```
-
-测试用假的 agy 进程（`test/` 下的 ACP stdio 服务）跑完整的 ACP 与 MCP 链路，不调用真实
-agy，不消耗额度。
 
 ## License
 

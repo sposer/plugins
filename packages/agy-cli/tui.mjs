@@ -3,15 +3,35 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
-import { tokenFile } from "./account.mjs"
+import { fileURLToPath } from "node:url"
+import { terminalCredential, tokenFile } from "./account.mjs"
+import { prepareTuiInput } from "./tui-input.mjs"
 
 const SCRIPT = "/usr/bin/script"
 const MAX_TRANSCRIPT = 32 * 1024 * 1024
 const PASTE_ON = "\x1b[?2004h"
 const READY = "? for shortcuts"
-// All action namespaces in https://antigravity.google/docs/permissions?tab=cli.
-const DENY = ["read_file", "write_file", "read_url", "execute_url", "download_url", "command", "unsandboxed", "mcp"]
+const BRIDGE_SERVER = "bridge"
+const BRIDGE_AGENT = "magpie-tui-bridge"
+const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
+const bridgeModelName = name => `mcp_${BRIDGE_SERVER}_${name}`
+// Local action namespaces in https://antigravity.google/docs/permissions?tab=cli.
+const DENY_LOCAL = ["read_file", "write_file", "read_url", "execute_url", "download_url", "command", "unsandboxed"]
   .map(action => `${action}(*)`)
+
+function bridgeToolNames(mcp) {
+  if (mcp === undefined) return []
+  if (!Array.isArray(mcp?.tools) || !Number.isInteger(mcp.port) || mcp.port < 1 || mcp.port > 65535 ||
+      typeof mcp.token !== "string" || !mcp.token) {
+    throw tuiError("invalid TUI MCP configuration")
+  }
+  const names = mcp.tools.map(tool => tool?.name)
+  // These names go inside individual permission selectors, never as patterns.
+  if (names.some(name => typeof name !== "string" || !/^[a-zA-Z0-9_-]+$/.test(name))) {
+    throw tuiError("invalid TUI MCP tool name", 400)
+  }
+  return names
+}
 
 function tuiError(message, statusCode = 502) {
   return Object.assign(new Error(`agy bridge: ${message}`), { statusCode })
@@ -25,7 +45,7 @@ function quote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
 
-async function setup(root, env) {
+async function setup(root, env, mcp, toolNames) {
   const home = path.join(root, "home")
   const cwd = path.join(root, "work")
   const cli = path.dirname(tokenFile(home))
@@ -33,11 +53,11 @@ async function setup(root, env) {
   await fs.mkdir(cwd, { mode: 0o700 })
   await fs.mkdir(cache, { recursive: true, mode: 0o700 })
 
-  // With native ADC, leave the original explicit credential path in env. Do
-  // not load settings, MCP, plugins or other state from the selected HOME.
-  if (env.HOME && !(env.AGY_ADC_AUTH === "true" && env.GOOGLE_APPLICATION_CREDENTIALS)) {
+  // Do not load settings, MCP, plugins or other state from the selected HOME.
+  const credential = terminalCredential(env)
+  if (credential && !credential.adc) {
     let token
-    try { token = await fs.readFile(tokenFile(env.HOME)) } catch (err) {
+    try { token = await fs.readFile(credential.file) } catch (err) {
       if (err.code !== "ENOENT") throw err
     }
     if (token) await fs.writeFile(tokenFile(home), token, { mode: 0o600 })
@@ -45,11 +65,45 @@ async function setup(root, env) {
   const write = (file, object) => fs.writeFile(file, JSON.stringify(object), { mode: 0o600 })
   // --settings in 1.5.18 does not accept strictMode. Trust only the empty
   // workspace created above; trusting it does not override the explicit denies.
+  const bridge = toolNames.length > 0
   await write(path.join(cli, "settings.json"), {
     strictMode: true,
     trustedWorkspaces: [cwd],
-    permissions: { allow: [], ask: [], deny: DENY },
+    permissions: {
+      allow: toolNames.map(name => `mcp(${BRIDGE_SERVER}/${name})`),
+      ask: [],
+      deny: bridge ? DENY_LOCAL : [...DENY_LOCAL, "mcp(*)"],
+    },
   })
+  if (bridge) {
+    // Use the same stdio configuration written by `agy mcp add` in the private HOME.
+    // The agent adds no local tools and inherits only this private MCP catalog.
+    const config = path.join(path.dirname(cli), "config")
+    const agent = path.join(cwd, ".agents", "agents", BRIDGE_AGENT)
+    await fs.mkdir(config, { recursive: true, mode: 0o700 })
+    await fs.mkdir(agent, { recursive: true, mode: 0o700 })
+    await write(path.join(config, "mcp_config.json"), { mcpServers: {
+      [BRIDGE_SERVER]: {
+        command: process.execPath,
+        args: [MCP_SERVER_PATH],
+        env: { AGY_BRIDGE_CONTROL_PORT: String(mcp.port), AGY_BRIDGE_TOKEN: mcp.token },
+      },
+    } })
+    await fs.writeFile(path.join(agent, "agent.md"), [
+      "---",
+      `name: ${BRIDGE_AGENT}`,
+      "description: Bridges only client-declared tools",
+      "mainAgent: true",
+      "subagent: false",
+      "tools: []",
+      "inheritMcp: true",
+      "inheritCustomizations: false",
+      "excludeDefaultComponents: true",
+      "---",
+      "Use only the client MCP tools for tool calls.",
+      "",
+    ].join("\n"), { mode: 0o600 })
+  }
   // Local UI state for an already configured gateway account. Do not send
   // wizard keystrokes (which can also toggle the default data-use checkbox).
   await write(path.join(cache, "onboarding.json"), {
@@ -59,6 +113,7 @@ async function setup(root, env) {
   const local = {
     ...env,
     HOME: home,
+    ...(credential?.adc ? { GOOGLE_APPLICATION_CREDENTIALS: credential.file } : {}),
     XDG_CONFIG_HOME: path.join(home, ".config"),
     XDG_CACHE_HOME: path.join(home, ".cache"),
     XDG_DATA_HOME: path.join(home, ".local", "share"),
@@ -84,7 +139,7 @@ function reportedFailure(screen) {
   return tuiError("the native TUI turn failed", status || 502)
 }
 
-function parseTranscript(serialized, prompt) {
+function parseTranscript(serialized, prompt, allowedToolCalls) {
   let input = false
   let result
   const requestPrefix = `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>`
@@ -110,8 +165,17 @@ function parseTranscript(serialized, prompt) {
     if (row.error || /^(?:ERROR|FAILED|INVALID|CANCEL(?:L?ED)|ABORTED)$/.test(row.status) || row.type === "ERROR") {
       throw tuiError("the native TUI turn failed")
     }
-    if (row.tool_calls?.length) throw tuiError("the native TUI requested a tool in text-only mode")
-    if (row.type !== "PLANNER_RESPONSE" || row.source !== "MODEL" || row.status !== "DONE") continue
+    const planner = row.type === "PLANNER_RESPONSE" && row.source === "MODEL" && row.status === "DONE"
+    if (row.tool_calls?.length) {
+      if (!allowedToolCalls.size) throw tuiError("the native TUI requested a tool in text-only mode")
+      if (!planner || !Array.isArray(row.tool_calls) || !row.tool_calls.every(call => allowedToolCalls.has(call?.name))) {
+        throw tuiError("the native TUI requested an unapproved tool")
+      }
+      // DONE refers to the planner step, not the turn. The MCP request may still be waiting.
+      result = undefined
+      continue
+    }
+    if (!planner) continue
     if (typeof row.content !== "string" || !row.content.trim()) continue
     const count = key => Number.isSafeInteger(row[key]) && row[key] >= 0 ? row[key] : 0
     result = {
@@ -125,7 +189,10 @@ function parseTranscript(serialized, prompt) {
   return partial ? undefined : result
 }
 
-function transcriptReader(brain, prompt) {
+// decision: read completed native transcript rows; not PTY repaint bytes
+// because edits and wrapping are not append-only model text. Revisit when AGY
+// exposes reply deltas before step completion (docs/decisions/001-native-agy-tool-routing.md).
+function transcriptReader(brain, prompt, allowedToolCalls) {
   let file, previousSize, previousTime
   return async () => {
     try {
@@ -143,17 +210,18 @@ function transcriptReader(brain, prompt) {
       if (Buffer.byteLength(bytes) > MAX_TRANSCRIPT) throw tuiError("the native TUI transcript is too large")
       previousSize = stat.size
       previousTime = stat.mtimeMs
-      return parseTranscript(bytes, prompt)
+      return parseTranscript(bytes, prompt, allowedToolCalls)
     } catch (err) {
       if (err.code !== "ENOENT") throw err
     }
   }
 }
 
-function launch(agyPath, model, effort, local, pidFile) {
+function launch(agyPath, model, effort, local, pidFile, bridge) {
   // decision: use native default mode with explicit denies; not plan because
   // agy rewrites the prompt as /plan and injects planning/artifact instructions.
   const args = [agyPath, "--model", model, "--log-file", "/dev/null"]
+  if (bridge) args.push("--agent", BRIDGE_AGENT)
   if (effort) args.push("--effort", effort)
   // util-linux script creates a second session whose leader is its command
   // shell. exec preserves that PID and lets cleanup signal the entire PTY group.
@@ -192,20 +260,15 @@ async function stop(child, closed, pidFile) {
   child.stdin.destroy()
 }
 
-export async function runTui(agyPath, { prompt, model, effort, signal, timeoutMs = 120_000, env = {} }) {
+export async function runTui(agyPath, { prompt, parts, model, effort, signal, timeoutMs = 120_000, env = {}, mcp }) {
   if (signal?.aborted) throw cancelled()
   if (process.platform !== "linux") throw tuiError("TUI mode requires Linux and util-linux script", 503)
-  if (typeof prompt !== "string") throw tuiError("TUI mode requires a text prompt", 400)
-  prompt = prompt.replace(/\r\n?/g, "\n").trim()
-  // Only literal text enters the editor. Keys/escape sequences and the TUI's
-  // slash-command and shell entrypoints are not part of this runner's input.
-  if (!prompt || /^[!/]/.test(prompt) || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(prompt)) {
-    throw tuiError("the prompt is not supported as literal TUI input", 400)
-  }
   if (typeof model !== "string" || !model || typeof agyPath !== "string" || !agyPath) {
     throw tuiError("TUI mode requires an agy executable and model", 400)
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw tuiError("invalid TUI timeout", 400)
+  const toolNames = bridgeToolNames(mcp)
+  const allowedToolCalls = new Set(toolNames.map(bridgeModelName))
   const deadline = performance.now() + timeoutMs
   let root, child, closed
   const wake = new AbortController()
@@ -224,10 +287,13 @@ export async function runTui(agyPath, { prompt, model, effort, signal, timeoutMs
   }
   try {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "magpie-agy-tui-"))
-    const local = await setup(root, env)
+    const local = await setup(root, env, mcp, toolNames)
+    const input = await prepareTuiInput(root, { prompt, parts, env: local.env })
+    const text = input.expectedPrompt
+    local.env = input.env
     const pidFile = path.join(root, "pty.pid")
     check()
-    child = launch(path.resolve(agyPath), model, effort, local, pidFile)
+    child = launch(path.resolve(agyPath), model, effort, local, pidFile, toolNames.length > 0)
     closed = new Promise(resolve => child.once("close", resolve))
     child.once("error", () => { problem ||= tuiError("could not launch the native TUI or util-linux script", 503); abort() })
     child.once("close", () => { problem ||= tuiError("the native TUI exited before a complete turn"); abort() })
@@ -246,10 +312,8 @@ export async function runTui(agyPath, { prompt, model, effort, signal, timeoutMs
     check()
     // decision: paste via stdin, not --prompt-interactive because argv exposes
     // gateway prompts to other processes running as the same user.
-    child.stdin.write(`\x1b[200~${prompt}\x1b[201~`)
-    await pause(35)
-    child.stdin.write("\r")
-    const read = transcriptReader(local.brain, prompt)
+    await input.paste(child.stdin, pause, () => screen.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""))
+    const read = transcriptReader(local.brain, text, allowedToolCalls)
     for (;;) {
       check()
       const result = await read()

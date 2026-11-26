@@ -637,13 +637,12 @@ test("recursive nullable $ref preserves [object, null] at the cycle boundary", (
 })
 
 test("bridge request path delivers expanded schemas to MCP tools/list without inventing a ToolSearch schema", async () => {
-  const kit = await createBridgeKit()
+  let listed
+  const kit = await createBridgeKit({ runTui: async (_file, { mcp }) => {
+    listed = await kit.control({ token: mcp.token, kind: "list" })
+    return { text: "checked tools" }
+  } })
   try {
-    let listed = null
-    kit.prompts.push(async (agent) => {
-      listed = await agent.listTools()
-      await agent.text("checked tools")
-    })
 
     const res = await kit.request(baseBody({
       tools: [
@@ -709,56 +708,33 @@ test("bridge request path delivers expanded schemas to MCP tools/list without in
   }
 })
 
-// plugins#1140: agy drops whole tools, the largest first, past its 20,000
-// customization tokens (ceil(UTF-8 bytes / 3)). Over the bridge, a catalog
-// larger than that comes back to agy whole, with shorter descriptions.
-test("bridge tools/list keeps every tool of a catalog over agy's budget, within it", async () => {
-  const kit = await createBridgeKit()
-  try {
-    let listed = null
-    kit.prompts.push(async (agent) => {
-      listed = await agent.listTools()
-      await agent.text("checked tools")
-    })
-    const prose = (n) => "Runs the step it names and says what it did. ".repeat(n) + "Examples: step('a'), step('b')."
-    const tools = Array.from({ length: 100 }, (_, i) => ({
-      name: `big_tool_${i}`,
-      description: prose(8),
-      input_schema: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: prose(6) },
-          mode: { type: "string", enum: ["fast", "safe"], description: "How." },
-        },
-        required: ["path"],
-      },
-    }))
-    const tokens = (list) => list.reduce((n, t) => n + Math.ceil(Buffer.byteLength(JSON.stringify(t), "utf8") / 3), 0)
-    const res = await kit.request(baseBody({ tools }))
-    await readSse(res)
-    const mcpTools = listed?.result?.tools ?? []
-    assert.deepEqual(mcpTools.map((t) => t.name), tools.map((t) => t.name))
-    assert.ok(tokens(tools) > 20000, `the catalog is over agy's budget (${tokens(tools)})`)
-    assert.ok(tokens(mcpTools) <= 18000, `what agy is given fits (${tokens(mcpTools)})`)
-    for (const t of mcpTools) {
-      assert.deepEqual(t.inputSchema.required, ["path"])
-      assert.deepEqual(t.inputSchema.properties.mode.enum, ["fast", "safe"])
-      assert.equal(t.inputSchema.properties.mode.description, "How.")
-      assert.equal(t._meta?.["antigravity/alwaysLoad"], true)
-    }
-  } finally {
-    await kit.dispose()
+test("native run_command leaves AGY's summary optional and restores it for the client", async t => {
+  let listed
+  const kit = await createBridgeKit({ runTui: async (_file, { mcp }) => {
+    listed = await kit.control({ token: mcp.token, kind: "list" })
+    await kit.control({ token: mcp.token, kind: "call", name: "run_command", arguments: { CommandLine: "pwd" } })
+  } })
+  t.after(() => kit.dispose())
+  const input_schema = {
+    type: "object",
+    properties: { CommandLine: { type: "string" }, toolSummary: { type: "string" } },
+    required: ["CommandLine", "toolSummary"],
   }
+  const reply = await readSse(await kit.request(baseBody({ tools: [{ name: "run_command", input_schema }] })))
+  assert.deepEqual(listed.result.tools[0].inputSchema.required, ["CommandLine"])
+  assert.equal(reply.stopReason, "tool_use")
+  assert.deepEqual(reply.content[0].input, { CommandLine: "pwd", toolSummary: "Run command" })
+  assert.deepEqual(input_schema.required, ["CommandLine", "toolSummary"])
 })
 
-test("bridge tools/list preserves nullable enum and constraint hints under lean budget trimming", async () => {
-  const kit = await createBridgeKit()
+// AGY drops large tools beyond its customization budget (#1140).
+test("native tools/list retains every tool and the constraints in an oversized catalog", async () => {
+  let listed
+  const kit = await createBridgeKit({ runTui: async (_file, { mcp }) => {
+    listed = await kit.control({ token: mcp.token, kind: "list" })
+    return { text: "checked nullable enums" }
+  } })
   try {
-    let listed = null
-    kit.prompts.push(async (agent) => {
-      listed = await agent.listTools()
-      await agent.text("checked nullable enums")
-    })
     const prose = (n) => "Controls execution behavior across the workspace. ".repeat(n) + "Examples: run('a'), run('b')."
     const cases = [
       {

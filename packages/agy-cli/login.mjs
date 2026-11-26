@@ -1,17 +1,20 @@
-import os from "node:os"
+import fs from "node:fs"
+import path from "node:path"
+import { StringDecoder } from "node:string_decoder"
 import { stripVTControlCharacters } from "node:util"
-import { spawnAgy, stopAgy } from "./platform.mjs"
+import { currentHome, tokenFile } from "./account.mjs"
+import { childEnv } from "./platform.mjs"
+import { parseStored } from "./signin.mjs"
 
 export const LOGIN_WAIT_MS = 15 * 60 * 1000
 export const LOGIN_START_MS = 30_000
 export const LOGIN_FINISH_MS = 60_000
-const SIGN_IN_LINK = /https:\/\/accounts\.google\.com\/[^\s"'<>]+(?=[\s"'<>])/
+const GOOGLE_MENU = "> 1. Google OAuth"
+const CODE_FIELD = "authorization code..."
+const OSC_LINK = /\x1b\]8;[^;\x1b\x07]*;(https:\/\/accounts\.google\.com\/o\/oauth2\/[^\s\x1b\x07]+)(?:\x07|\x1b\\)/
+const OSC = /\x1b\]8;[^\x1b\x07]*(?:\x07|\x1b\\)/g
 const OUTPUT_CHARS = 16 * 1024
 let pending = null
-
-function lastLine(text) {
-  return String(text).split(/\r?\n/).map(line => line.trim()).filter(Boolean).at(-1) ?? ""
-}
 
 // One owner for native and configured login attempts: replacement, cancellation,
 // deadlines and single submission. onFailure releases only the unfinished home.
@@ -43,19 +46,26 @@ export class LoginAttempt {
     this.timers.clear()
     this.signal?.removeEventListener("abort", this.onAbort)
     if (pending === this) pending = null
+    const finish = () => {
+      if (value.error) this.onFailure?.()
+      this.resolve(value)
+      this.onEnd?.(value)
+    }
     if (value.error) {
       this.controller.abort()
-      this.onStop?.()
-      this.onFailure?.()
+      const stopping = this.onStop?.()
+      if (stopping) {
+        stopping.then(finish, finish)
+        return
+      }
     }
-    this.resolve(value)
-    this.onEnd?.(value)
+    finish()
   }
 
   cancel(error) { this.end({ error }) }
 
   async submit(work, { signal, finishMs = LOGIN_FINISH_MS } = {}) {
-    if (this.result) return { error: this.result.error || "this sign-in is over; start it again" }
+    if (this.result) return this.result.error ? this.done : { error: "this sign-in is over; start it again" }
     if (this.submitted) return { error: "this sign-in is already checking a code" }
     this.submitted = true
     const cancel = () => this.cancel("the sign-in was cancelled")
@@ -71,65 +81,111 @@ export class LoginAttempt {
   }
 }
 
-// agy owns its native Google exchange. SSH on this login child selects its
-// manual link/code flow; background CLI launches retain their existing environment.
+// decision: drive the native terminal login menu; not the CLI's print-mode
+// sign-in prompt because that command would run a model turn after sign-in.
+// Revisit when agy exposes a standalone native sign-in command.
 export async function startLogin(agy, options = {}) {
+  const home = currentHome()
+  if (!home) return { error: "native sign-in needs a new account home" }
+  const file = tokenFile(home)
+  if (fs.existsSync(file)) return { error: "this account home already has a sign-in" }
   const { startMs = LOGIN_START_MS } = options
   const attempt = new LoginAttempt(options)
   if (attempt.result) return attempt.result
+  if (process.platform !== "linux" || typeof globalThis.Bun?.Terminal !== "function") {
+    attempt.cancel("native sign-in requires Bun terminal support on Linux; use OAuth configuration, tokens, or an import instead")
+    return attempt.done
+  }
   return new Promise(resolve => {
-    let child
+    let child, terminal, stopping, poll, complete
     let out = ""
+    let selected = false
     let shown = false
-    let closed
-    const exit = new Promise(resolve => { closed = resolve })
-    attempt.onStop = () => { if (child) stopAgy(child) }
-    attempt.onEnd = value => { if (!shown) resolve(value) }
-    try {
-      child = spawnAgy(agy, ["acp", "--login"], {
-        cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"],
-        // Official install docs: the SSH environment selects the manual URL
-        // loop rather than launching the default browser, even for a first login.
-        env: { SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 0" },
-      })
-    } catch (error) {
-      attempt.cancel(`couldn't run agy: ${error.message}`)
-      return
-    }
+    const decoder = new StringDecoder("utf8")
     const startTimer = attempt.timer(() => {
-      attempt.cancel(`agy didn't print a sign-in link within ${Math.round(startMs / 1000)}s${lastLine(out) ? `: ${lastLine(out)}` : ""}`)
+      attempt.cancel("agy didn't show the native Google sign-in prompt; check `agy` in a terminal or use OAuth configuration")
     }, startMs)
-    const read = data => {
-      out = stripVTControlCharacters(out + data).slice(-OUTPUT_CHARS)
-      if (shown || attempt.result) return
-      const url = SIGN_IN_LINK.exec(out)?.[0]
-      if (!url) return
-      shown = true
-      clearTimeout(startTimer)
-      resolve({ url, finish })
-    }
-    child.stdout?.setEncoding("utf8")
-    child.stderr?.setEncoding("utf8")
-    child.stdout?.on("data", read)
-    child.stderr?.on("data", read)
-    child.stdin?.on("error", error => attempt.cancel(`couldn't send the code to agy: ${error.message}`))
-    child.on("error", error => attempt.cancel(`couldn't run agy: ${error.message}`))
-    child.on("close", code => {
-      if (shown && attempt.submitted && code === 0) return closed({ ok: true, said: lastLine(out) })
-      if (!shown && /Usage:|Usage of/.test(out)) {
-        return attempt.cancel("this agy has no `agy acp --login`; update it with `agy update`")
+    const stop = () => stopping ??= (async () => {
+      clearInterval(poll)
+      try {
+        if (child) {
+          child.kill("SIGKILL")
+          await child.exited
+        }
+      } finally { terminal?.close() }
+    })()
+    attempt.onStop = stop
+    attempt.onEnd = value => { if (!shown) resolve(value) }
+
+    // The interactive CLI remains open after authentication. Only accept a
+    // credential it wrote in this fresh home, then close the CLI before probing.
+    function checkToken() {
+      if (!complete || attempt.result || stopping) return false
+      try {
+        if (parseStored(fs.readFileSync(file, "utf8")).state !== "present") return false
+      } catch (error) {
+        if (error.code === "ENOENT") return false
+        attempt.cancel("couldn't read the new agy sign-in")
+        return true
       }
-      if (/invalid_grant/.test(out)) return attempt.cancel("Google turned the code away; start the sign-in again with a new link")
-      attempt.cancel(lastLine(out) || `agy exited with code ${code} before completing the sign-in`)
-    })
+      stop().then(() => complete({ ok: true }), () => attempt.cancel("couldn't close the agy sign-in terminal"))
+      return true
+    }
+
+    function read(term, data) {
+      if (attempt.result || stopping) return
+      out = (out + decoder.write(data)).slice(-OUTPUT_CHARS)
+      const screen = stripVTControlCharacters(out.replace(OSC, ""))
+      if (!selected && screen.includes(GOOGLE_MENU) && screen.includes("Navigate · enter Select")) {
+        selected = true
+        out = ""
+        try { term.write("\r") } catch { attempt.cancel("couldn't select Google OAuth in agy") }
+      } else if (selected && !shown && screen.includes(CODE_FIELD)) {
+        // Read the OSC 8 target, not the rendered URL, which wraps across lines.
+        const url = OSC_LINK.exec(out)?.[1]
+        if (!url) return
+        shown = true
+        out = ""
+        clearTimeout(startTimer)
+        resolve({ url, finish })
+      } else if (complete && screen.includes("Press any key to go back.")) {
+        attempt.cancel(/invalid_grant/i.test(screen)
+          ? "Google turned the code away; start the sign-in again with a new link"
+          : "agy couldn't complete Google sign-in; start the sign-in again or check `agy` in a terminal")
+      }
+    }
+
+    try {
+      // SSH selects the manual URL/code flow. Keep CLI state and credentials
+      // in the new account home even if the host sets its own config paths.
+      const env = childEnv(process.env, {
+        TERM: "xterm-256color",
+        XDG_CONFIG_HOME: path.join(home, ".config"),
+        XDG_CACHE_HOME: path.join(home, ".cache"),
+        XDG_DATA_HOME: path.join(home, ".local", "share"),
+        XDG_STATE_HOME: path.join(home, ".local", "state"),
+        AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "true",
+      })
+      for (const key of ["AGY_ADC_AUTH", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "ANTIGRAVITY_GEMINI_DIR", "ANTIGRAVITY_CONFIG_REL_DIR", "ANTIGRAVITY_APP_DATA_DIR", "ANTIGRAVITY_EXECUTABLE_DATA_DIR",
+        "ANTIGRAVITY_PROJECT_ID", "AGY_CLI_INTERACTIVE_HEADLESS", "AGY_CLI_NONINTERACTIVE_HEADLESS", "NO_COLOR"]) delete env[key]
+      terminal = new Bun.Terminal({ cols: 160, rows: 40, data: read })
+      child = Bun.spawn([path.resolve(agy), "--log-file", "/dev/null"], { cwd: home, env, terminal })
+      child.exited.then(() => {
+        if (!stopping && !checkToken()) attempt.cancel("agy exited before completing Google sign-in")
+      }, () => attempt.cancel("couldn't run the native agy sign-in terminal"))
+    } catch {
+      attempt.cancel("couldn't start the native agy sign-in terminal")
+    }
 
     function finish(code, options) {
-      return attempt.submit(async () => {
+      return attempt.submit(() => new Promise(resolveFinish => {
         const value = String(code ?? "").trim()
-        if (!value || /[\r\n]/.test(value)) throw new Error("paste the code or the full URL the sign-in page shows")
-        child.stdin.write(value + "\n")
-        return exit
-      }, options)
+        if (!value || /[^\x21-\x7e]/.test(value)) throw new Error("paste the code or the full URL the sign-in page shows")
+        complete = resolveFinish
+        terminal.write(value + "\r")
+        poll = setInterval(checkToken, 100)
+      }), options)
     }
   })
 }

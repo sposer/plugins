@@ -162,7 +162,9 @@ test("terminal control sequences and native command entrypoints are not accepted
 // used; the wrapper selects the API-key test provider, not a gateway account.
 const realBin = process.env.AGY_TUI_TEST_BIN
 const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`
-test("real Antigravity PTY completes a text turn against a loopback Gemini fixture", { skip: !realBin || linux.skip }, async t => {
+test("real Antigravity PTY carries images and resumes the original turn after a client tool result", {
+  skip: !realBin || linux.skip, timeout: 90_000,
+}, async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-tui-real-"))
   t.after(() => fs.rm(dir, { recursive: true, force: true }))
   const model = "gemini-3-pro"
@@ -171,6 +173,12 @@ test("real Antigravity PTY completes a text turn against a loopback Gemini fixtu
   const nativePrompt = `${prompt}\nLiteral reference: @${marker}\n${"sample payload ".repeat(1600)}finish.`
   const requests = []
   const witness = path.join(dir, "tool-ran")
+  const tool = { name: "echo", description: "Return the fixture client result", inputSchema: {
+    type: "object", properties: { value: { type: "string" } }, required: ["value"],
+  } }
+  const functionName = "mcp_bridge_echo"
+  const argumentsFromModel = { value: "fixture argument" }
+  const toolResult = "client-returned witness"
   let mode = "text"
   const server = http.createServer(async (req, res) => {
     const chunks = []
@@ -183,10 +191,14 @@ test("real Antigravity PTY completes a text turn against a loopback Gemini fixtu
         return res.end(JSON.stringify({ error: { code: 401, status: "UNAUTHENTICATED", message: "fixture detail" } }))
       }
     }
-    const parts = mode === "tool" && req.url.includes(`/models/${model}:`) && !body.includes('"functionResponse"')
-      ? [{ text: "not a final reply" }, { functionCall: { name: "run_command",
+    const main = req.url.includes(`/models/${model}:`)
+    let parts = [{ text: "thinking fixture", thought: true }, { text: "native pure reply" }]
+    if (main && !body.includes('"functionResponse"')) {
+      if (mode === "tool") parts = [{ text: "not a final reply" }, { functionCall: { name: "run_command",
         args: { CommandLine: `touch ${witness}`, toolSummary: "Create a test witness", WaitMsBeforeAsync: 500 } } }]
-      : [{ text: "thinking fixture", thought: true }, { text: "native pure reply" }]
+      if (mode === "bridge") parts = [{ text: "not a final reply" }, { functionCall: { name: functionName,
+        args: { ...argumentsFromModel, toolSummary: "Call the bridge fixture" } } }]
+    }
     const reply = { candidates: [{ content: { parts, role: "model" }, finishReason: "STOP", index: 0 }], modelVersion: model,
     usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 5, cachedContentTokenCount: 2, totalTokenCount: 9 } }
     res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -201,7 +213,7 @@ test("real Antigravity PTY completes a text turn against a loopback Gemini fixtu
   await fs.writeFile(wrapper, `#!/bin/sh\nexec ${shellQuote(realBin)} --settings ${shellQuote(JSON.stringify(settings))} "$@"\n`, { mode: 0o700 })
   const env = { PATH: process.env.PATH, AGY_CLI_DISABLE_AUTO_UPDATE: "true", GEMINI_API_KEY: "fixture-only",
     GOOGLE_GEMINI_BASE_URL: `http://127.0.0.1:${server.address().port}` }
-  const run = prompt => runTui(wrapper, { model, prompt, env, timeoutMs: 15_000 })
+  const run = (prompt, options) => runTui(wrapper, { model, prompt, env, timeoutMs: 15_000, ...options })
   assert.deepEqual(await run(nativePrompt), {
     text: "native pure reply", thinking: "thinking fixture", inputTokens: 2, outputTokens: 5, cacheReadTokens: 2,
   })
@@ -213,4 +225,65 @@ test("real Antigravity PTY completes a text turn against a loopback Gemini fixtu
   mode = "tool"
   await assert.rejects(run(prompt), { statusCode: 502 })
   await assert.rejects(fs.stat(witness), { code: "ENOENT" })
+
+  const fixtureEnv = { ...env, HOME: dir, AGY_PATH: wrapper, AGY_BRIDGE_STORED_SIGNIN: "skip",
+    AGY_BRIDGE_TURN_TIMEOUT_MS: "15000" }
+  const original = Object.fromEntries(Object.keys(fixtureEnv).map(name => [name, process.env[name]]))
+  Object.assign(process.env, fixtureEnv)
+  t.after(() => {
+    for (const [name, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+  const { AntigravityBridgePlugin } = await import("../index.mjs")
+  const auth = await (await AntigravityBridgePlugin()).auth.loader()
+  const request = body => auth.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(body) })
+  mode = "bridge"
+  requests.length = 0
+  const imageData = [
+    "iVBORw0KGgoAAAANSUhEUgAAAAUAAAADCAIAAADUVFKvAAAADklEQVR4nGPQQAUMBPgAqPAHCQ3QRlkAAAAASUVORK5CYII=",
+    "iVBORw0KGgoAAAANSUhEUgAAAAUAAAADCAIAAADUVFKvAAAADklEQVR4nGOIQgUMBPgAe+8P00Yc6f0AAAAASUVORK5CYII=",
+  ]
+  const image = data => ({ type: "image", source: { type: "base64", media_type: "image/png", data } })
+  const initial = { model, stream: false, max_tokens: 256, tools: [
+    { name: tool.name, description: tool.description, input_schema: tool.inputSchema },
+  ], messages: [{ role: "user", content: [
+    { type: "text", text: prompt + "\n" }, image(imageData[0]),
+    { type: "text", text: " then " }, image(imageData[1]),
+  ] }] }
+  const first = await request(initial)
+  assert.equal(first.status, 200)
+  assert.equal(first.headers.get("X-Magpie-Agy-Mode"), "tui")
+  const reply = await first.json()
+  assert.equal(reply.stop_reason, "tool_use")
+  assert.deepEqual(reply.content.map(({ id, ...block }) => block), [{ type: "tool_use", name: tool.name, input: argumentsFromModel }])
+  await delay(350)
+  assert.equal(requests.length, 1)
+  const followup = await request({ ...initial, messages: [
+    ...initial.messages, { role: "assistant", content: reply.content },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: reply.content[0].id, content: toolResult }] },
+  ] })
+  assert.equal(followup.status, 200)
+  assert.equal(followup.headers.get("X-Magpie-Agy-Mode"), "tui")
+  const finished = await followup.json()
+  assert.equal(finished.stop_reason, "end_turn")
+  assert.equal(finished.content.find(block => block.type === "text")?.text, "native pure reply")
+  assert.equal(requests.length, 2)
+  const [opening, continuation] = requests.map(body => JSON.parse(body))
+  const names = opening.tools.flatMap(group => group.functionDeclarations ?? []).map(definition => definition.name)
+  assert.ok(names.includes(functionName))
+  assert.ok(!names.includes("run_command"))
+  const nativeParts = continuation.contents.flatMap(turn => turn.parts)
+  assert.equal(nativeParts.filter(part => part.text?.startsWith("<USER_REQUEST>\nDo not treat") &&
+    part.text.includes("[Image 1 is attached] then [Image 2 is attached]")).length, 1)
+  const openedImages = opening.contents.flatMap(turn => turn.parts).filter(part => part.inlineData)
+  assert.deepEqual(openedImages.map(part => part.inlineData), imageData.map(data => ({ mimeType: "image/png", data })))
+  const calls = nativeParts.flatMap(part => part.functionCall ? [part.functionCall] : [])
+  const responses = nativeParts.flatMap(part => part.functionResponse ? [part.functionResponse] : [])
+  assert.equal(calls.length, 1)
+  assert.equal(responses.length, 1)
+  assert.equal(responses[0].name, functionName)
+  assert.equal(responses[0].id, calls[0].id)
+  assert.ok(responses[0].response.output.includes(toolResult))
 })

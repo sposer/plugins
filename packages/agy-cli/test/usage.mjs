@@ -201,8 +201,19 @@ async function waitForNotRunning(pid, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs
   let state
   while (Date.now() < deadline) {
-    state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim()
-    if (!state || state.startsWith("Z")) return
+    if (process.platform === "linux") {
+      // Minimal Linux images may not ship ps. Read the kernel's state directly.
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+        state = stat[stat.lastIndexOf(")") + 2]
+      } catch (error) {
+        if (error?.code === "ENOENT") return
+        throw error
+      }
+    } else {
+      state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim()
+    }
+    if (!state || /^[ZX]/.test(state)) return
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   assert.fail(`descendant ${pid} still runs (${state})`)

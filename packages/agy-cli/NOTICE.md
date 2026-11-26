@@ -1,6 +1,6 @@
 # NOTICE：来源与合规说明
 
-本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
+本包（`@magpie-community/opencode-agy-cli-auth`）源自 Antigravity 桥接插件
 `opencode-antigravity-bridge`，由 gitxm 整理为 `gitxm/yce-magpie-agy` 后提交到
 magpie-community/plugins（plugins#785），以 MIT 协议发布。**与上游无隶属关系。** 上游版权声明原样保留在 [LICENSE](LICENSE)，
 本仓新增部分的版权归 gitxm 与 yce。
@@ -10,14 +10,12 @@ magpie-community/plugins（plugins#785），以 MIT 协议发布。**与上游�
 | 项目 | 取值 |
 |---|---|
 | npm 包名 | `@magpie-community/opencode-agy-cli-auth` |
-| 版本 | `0.1.0` |
 | 仓库 | `https://github.com/magpie-community/plugins`（`packages/agy-cli`） |
 | Magpie provider ID | `agy-cli` |
 | 安装 | `magpie plugin add @magpie-community/opencode-agy-cli-auth` |
 | 原始仓库 | `https://github.com/gitxm/yce-magpie-agy`（包名 `@magpie-community/yce-magpie-agy`、provider ID `yce-magpie-agy`，均未发布到 npm） |
 
-进程内部标识保持不变，以免影响已有的状态文件与日志：`AGY_BRIDGE_*` 环境变量、
-`magpie-agy-bridge/` 状态与临时目录、`[agy-bridge]` 日志前缀、导出名 `AntigravityBridgePlugin`。
+账号目录仍在 `magpie-agy-bridge/` 状态目录下。当前配置以 [README.md](README.md) 为准。
 
 ## 2. 来源基线
 
@@ -28,10 +26,11 @@ magpie-community/plugins（plugins#785），以 MIT 协议发布。**与上游�
 | 本机补丁（`index.mjs`） | `index.mjs.patched`，md5 `38aa8d42f3e76a2536d11be63b5807a5` | 基于上游 `212179f` 的本机补丁版 |
 | 本机补丁（`usage.mjs`） | `usage.mjs.patched`，md5 `df212a2c934ffd4a38d7f3ef95271c5d` | 基于上游 `7e13b12` 的本机补丁版 |
 
-合并原则：代码以 PR #8（`acb8d84`）为底。本机补丁中 `acb8d84` 没有的修复，按下面的
+首次并入时以 PR #8（`acb8d84`）为底。本机补丁中 `acb8d84` 没有的修复，按下面的
 A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的部分（多步用量结算、
 `requestedEffort`、`withStateLock`、`lineageVerdict`、`matchToolResults`、`inspectToolTurn`
-等）保留 `acb8d84` 的实现，不搬运补丁版代码。
+等）保留了 `acb8d84` 的实现，没有搬运补丁版代码。以下各项记录首次并入时的变更，
+不代表当前版本仍含这些实现。
 
 ## 3. `index.mjs` 并入的修复（A1–A16）
 
@@ -77,14 +76,14 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 [LICENSE](LICENSE) 保留上游版权行 `Copyright (c) 2026 DylanLIiii`，并依次列出
 `Copyright (c) 2026 gitxm` 与 `Copyright (c) 2026 yce`。MIT 正文未作修改。
 
-## 7. 从旧版迁移
+## 7. 包名与 provider ID 迁移
 
-旧版是包名 `magpie-agy` 0.2.0，provider ID 为 `antigravity-bridge`。改为 0.1.0 后：
+原包 `magpie-agy` 0.2.0 的 provider ID 为 `antigravity-bridge`。迁移到本包时：
 
 1. **provider ID 变化**：Magpie 中的 provider 变为 `agy-cli`。所有写着旧 ID 的模型名
    （`antigravity-bridge/<模型>`，或从 GitHub 安装 `gitxm/yce-magpie-agy` 时的 `yce-magpie-agy/<模型>`）
    都要改成 `agy-cli/<模型>`，包括路由组和会话里的模型引用。
 2. **登录态**：登录状态按 provider ID 记录。切换后需要在新 provider 上重新登录，或者把登录记录改名。
-3. **内部状态不变**：会话停车文件仍在 `magpie-agy-bridge/sessions.json`，已有会话可以续接。
-4. **切换顺序**：先安装新包，确认新 provider 能返回 200，再逐个改模型名；旧包最后移除。
-   本仓内不执行切换操作。
+3. **切换顺序**：先安装新包，确认新 provider 能返回 200，再逐个改模型名；旧包最后移除。
+
+原生 TUI 不续接旧的本地进程或会话记录；新用户回合使用请求所带的历史。

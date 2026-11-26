@@ -1,149 +1,130 @@
 import assert from "node:assert/strict"
-import { afterEach, test } from "node:test"
-import childProcess from "node:child_process"
-import { syncBuiltinESMExports } from "node:module"
-import { EventEmitter } from "node:events"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { test } from "node:test"
+import { dropHome, inAccount, newHome, tokenFile, writeTokenFile } from "../account.mjs"
 import { startLogin } from "../login.mjs"
 
-const spawn = childProcess.spawn
-const children = []
-const LINK = "https://accounts.google.com/o/oauth2/v2/auth?client_id=test&state=one"
-const tick = () => new Promise(resolve => setImmediate(resolve))
+const PTY = { skip: process.platform !== "linux" || typeof globalThis.Bun?.Terminal !== "function" }
+const LINK = "https://accounts.google.com/o/oauth2/auth?client_id=test&state=one"
+const CALLBACK = "https://antigravity.google/oauth-callback?code=sandbox&state=one"
+const TOKENS = JSON.stringify({ token: { refresh_token: "sandbox-refresh", access_token: "sandbox-access" } })
 
-function fixture() {
-  childProcess.spawn = (file, args, options) => {
-    const child = new EventEmitter()
-    child.launch = { file, args, options }
-    child.stdout = new EventEmitter()
-    child.stderr = new EventEmitter()
-    child.stdout.setEncoding = child.stderr.setEncoding = () => {}
-    child.stdin = new EventEmitter()
-    child.input = []
-    child.stdin.write = value => { child.input.push(value); child.onInput?.(); return true }
-    child.stdin.end = () => {}
-    child.kill = () => { child.stopped = true; queueMicrotask(() => child.emit("close", null)); return true }
-    children.push(child)
-    return child
+function fixture(t, { mode = "success", input = CALLBACK } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-login-test-"))
+  const account = newHome({ XDG_STATE_HOME: root })
+  const agy = path.join(root, "agy")
+  const pid = path.join(root, "pid")
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.writeFileSync(agy, `#!${process.execPath}
+import fs from "node:fs"
+import path from "node:path"
+const env = process.env
+fs.writeFileSync(${JSON.stringify(pid)}, String(process.pid))
+if (process.argv.slice(2).includes("acp") || !env.SSH_CONNECTION || env.HOME !== process.cwd() ||
+    !env.XDG_CONFIG_HOME.startsWith(env.HOME + path.sep) || env.ANTIGRAVITY_GEMINI_DIR || env.GEMINI_API_KEY) process.exit(2)
+const mode = ${JSON.stringify(mode)}
+const link = ${JSON.stringify(LINK)}
+process.stdin.setRawMode(true)
+process.stdin.setEncoding("utf8")
+let selected = false, input = ""
+process.stdin.on("data", chunk => {
+  input += chunk
+  if (!input.endsWith("\\r")) return
+  if (!selected && input === "\\r") {
+    selected = true
+    input = ""
+    process.stdout.write("\\x1b]8;id=mock;" + link.slice(0, 40))
+    setTimeout(() => {
+      process.stdout.write(link.slice(40) + "\\x1b\\\\Click here to authenticate\\x1b]8;;\\x1b\\\\\\nauthorization \\x1b[32mcode...\\x1b[0m\\n")
+    }, 10)
+  } else if (selected) {
+    if (mode === "stall") return
+    if (mode === "exit") process.exit(0)
+    if (input !== ${JSON.stringify(input + "\r")}) process.exit(3)
+    if (mode === "deny") return process.stdout.write("invalid_grant\\nPress any key to go back.\\n")
+    const file = ${JSON.stringify(tokenFile(account.home))}
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, ${JSON.stringify(TOKENS)})
   }
-  syncBuiltinESMExports()
+})
+if (mode !== "silent") process.stdout.write("Select login method:\\n> 1. Google OAuth\\n2. Use a Google Cloud project\\n↑/↓ Navigate · enter Select\\n")
+`, { mode: 0o755 })
+  return {
+    account,
+    start: options => inAccount(account.home, () => startLogin(agy, {
+      onFailure: () => dropHome(account.home), ...options,
+    })),
+    launched: () => fs.existsSync(pid),
+    stopped: () => assert.throws(() => process.kill(Number(fs.readFileSync(pid, "utf8")), 0), { code: "ESRCH" }),
+    stored: () => fs.readFileSync(tokenFile(account.home), "utf8"),
+  }
 }
 
-afterEach(async () => {
-  for (const child of children.splice(0)) child.kill()
-  await tick()
-  childProcess.spawn = spawn
-  syncBuiltinESMExports()
-})
-
-async function opened(options = {}) {
-  const pending = startLogin("agy", options)
-  const child = children.at(-1)
-  child.stdout.emit("data", LINK + "\nPaste the code: ")
-  return { login: await pending, child }
-}
-
-test("a cancelled authorize starts no agy process", async () => {
-  fixture()
-  const controller = new AbortController()
-  controller.abort()
-  const result = await startLogin("agy", { signal: controller.signal, startMs: 10 })
-  assert.ok(result.error)
-  assert.equal(children.length, 0)
-})
-
-test("the complete sign-in link is collected across stdout and stderr chunks", async () => {
-  fixture()
-  const pending = startLogin("agy")
-  const child = children.at(-1)
-  assert.equal(child.launch.options.env.SSH_CONNECTION, "127.0.0.1 0 127.0.0.1 0")
-  assert.deepEqual(child.launch.args, ["acp", "--login"])
-  let settled = false
-  pending.then(() => { settled = true })
-  child.stdout.emit("data", "\u001b[32m" + LINK.slice(0, 50))
-  await tick()
-  assert.equal(settled, false)
-  child.stderr.emit("data", LINK.slice(50) + "\u001b[0m\nPaste the code: ")
-  const login = await pending
+test("native Google login submits the callback once and succeeds after the credential is stored", PTY, async t => {
+  const f = fixture(t)
+  const login = await f.start()
   assert.equal(login.url, LINK)
-  child.onInput = () => queueMicrotask(() => child.emit("close", 0))
-  assert.equal((await login.finish(" full-page-url ")).ok, true)
-  assert.deepEqual(child.input, ["full-page-url\n"])
+  const done = login.finish(CALLBACK)
+  assert.ok((await login.finish("duplicate")).error)
+  assert.deepEqual(await done, { ok: true })
+  f.stopped()
+  assert.equal(f.stored(), TOKENS)
+  assert.ok((await login.finish("replay")).error)
+  assert.equal(f.stored(), TOKENS)
 })
 
-test("cancelling while the link is starting releases the wait and its resources", async () => {
-  fixture()
+test("native login never starts against an account with existing credentials", t => {
+  const f = fixture(t)
+  writeTokenFile(f.account.home, TOKENS)
+  return f.start().then(result => {
+    assert.ok(result.error)
+    assert.equal(f.launched(), false)
+    assert.equal(f.stored(), TOKENS)
+  })
+})
+
+test("native login cancellation and replacement release only the unfinished account homes", PTY, async t => {
+  const replaced = fixture(t)
+  const first = await replaced.start()
+  const f = fixture(t, { mode: "stall" })
+  const second = await f.start()
+  assert.ok((await first.finish(CALLBACK)).error)
+  replaced.stopped()
+  assert.equal(fs.existsSync(replaced.account.home), false)
   const controller = new AbortController()
-  let failures = 0
-  const pending = startLogin("agy", { signal: controller.signal, onFailure: () => failures++ })
-  const child = children.at(-1)
+  const done = second.finish(CALLBACK, { signal: controller.signal })
   controller.abort()
-  assert.ok((await pending).error)
-  assert.equal(child.stopped, true)
-  await tick()
-  assert.equal(failures, 1)
+  assert.ok((await done).error)
+  f.stopped()
+  assert.equal(fs.existsSync(f.account.home), false)
+  const cancelled = fixture(t)
+  assert.ok((await cancelled.start({ signal: controller.signal })).error)
+  assert.equal(cancelled.launched(), false)
+  assert.equal(fs.existsSync(cancelled.account.home), false)
 })
 
-test("an abandoned account is cleaned when the sign-in expires or is replaced", async () => {
-  fixture()
-  let failures = 0
-  const first = await opened({ onFailure: () => failures++ })
-  const second = await opened({ waitMs: 10, onFailure: () => failures++ })
-  assert.equal(first.child.stopped, true)
-  assert.ok((await first.login.finish("old-code")).error)
-  assert.deepEqual(first.child.input, [])
-  await new Promise(resolve => setTimeout(resolve, 25))
-  assert.equal(second.child.stopped, true)
-  assert.ok((await second.login.finish("late-code")).error)
-  assert.equal(failures, 2)
-})
-
-test("a cancelled callback never submits a code, even when already aborted", async () => {
-  fixture()
-  for (const before of [true, false]) {
-    const controller = new AbortController()
-    let failures = 0
-    const { login, child } = await opened({ onFailure: () => failures++ })
-    if (before) controller.abort()
-    const done = login.finish("code", { signal: controller.signal })
-    if (!before) controller.abort()
-    assert.ok((await done).error)
-    assert.equal(child.stopped, true)
-    assert.deepEqual(child.input, before ? [] : ["code\n"])
-    assert.equal(failures, 1)
+test("the TUI's rejection or exit without a new credential fails sign-in", PTY, async t => {
+  for (const mode of ["deny", "exit"]) {
+    const f = fixture(t, { mode, input: "sandbox-code" })
+    const login = await f.start()
+    assert.equal(login.url, LINK)
+    assert.ok((await login.finish("sandbox-code")).error)
+    f.stopped()
+    assert.equal(fs.existsSync(f.account.home), false)
   }
 })
 
-test("a callback submits its code once and succeeds only after agy exits successfully", async () => {
-  fixture()
-  let failures = 0
-  const { login, child } = await opened({ onFailure: () => failures++ })
-  const done = login.finish("code")
-  assert.ok((await login.finish("second-code")).error)
-  assert.deepEqual(child.input, ["code\n"])
-  child.emit("close", 0)
-  assert.equal((await done).ok, true)
-  assert.equal(failures, 0)
-  assert.ok((await login.finish("reused-code")).error)
-})
-
-test("process failures and both deadlines end the login and call cleanup once", async () => {
-  fixture()
-  let failures = 0
-  const opts = { onFailure: () => failures++ }
-  const noLink = startLogin("agy", { ...opts, startMs: 10 })
-  assert.ok((await noLink).error)
-  const slow = await opened(opts)
-  assert.ok((await slow.login.finish("code", { finishMs: 10 })).error)
-  assert.equal(slow.child.stopped, true)
-  const broken = await opened(opts)
-  const done = broken.login.finish("code")
-  broken.child.stdin.emit("error", new Error("pipe closed"))
-  assert.ok((await done).error)
-  const denied = await opened(opts)
-  const deniedDone = denied.login.finish("code")
-  denied.child.stderr.emit("data", 'oauth2: "invalid_grant"\n')
-  denied.child.emit("close", 1)
-  assert.ok((await deniedDone).error)
-  await tick()
-  assert.equal(failures, 4)
+test("native login releases the PTY at its startup or submission deadline", PTY, async t => {
+  const f = fixture(t, { mode: "silent" })
+  assert.ok((await f.start({ startMs: 300 })).error)
+  f.stopped()
+  assert.equal(fs.existsSync(f.account.home), false)
+  const checking = fixture(t, { mode: "stall" })
+  const login = await checking.start()
+  assert.equal(login.url, LINK)
+  assert.ok((await login.finish(CALLBACK, { finishMs: 25 })).error)
+  checking.stopped()
+  assert.equal(fs.existsSync(checking.account.home), false)
 })

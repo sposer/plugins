@@ -1,6 +1,5 @@
-// Runs the suites in test/ (brought over from gitxm/yce-magpie-agy, MIT), each
-// in a bun process of its own: they mock node:child_process, move the clock and
-// set the bridge's environment, and smoke.mjs ends with process.exit.
+// Runs the suites in test/ (brought over from gitxm/yce-magpie-agy, MIT) in
+// separate Bun processes: some mock built-ins or change the environment.
 import { expect, test } from "bun:test"
 import path from "node:path"
 
@@ -16,53 +15,28 @@ function run(args, timeout) {
 
 for (const [name, mocks] of [
   ["platform.mjs", true],
-  ["compat.mjs", true],
+  ["compat.mjs", false],
   ["prefill.mjs", false],
   ["usage.mjs", true],
   ["signin.mjs", false],
   ["login.mjs", true],
   ["oauth.mjs", false],
   ["catalog.mjs", false],
-  ["step-usage.mjs", false],
   ["tool-budget.mjs", false],
   ["tool-schema.mjs", false],
-  ["tool-summary.mjs", false],
-  ["usage-settlement.mjs", false],
-  ["steer-in-session.mjs", false],
-  ["dropped-call.mjs", false],
-  ["repeat-batch.mjs", false],
-  ["conversation-key.mjs", false],
-  ["windows-nc.mjs", false],
-  ["spare.mjs", false],
-  ["tools-listed.mjs", false],
   ["tui-routing.mjs", false],
   ["tui.mjs", false],
 ]) {
   test(`test/${name}`, () => {
-    // bun's 5s default per test is a fixed wait these process-spawning tests
-    // overrun on a loaded machine; the 240s run bounds a real hang.
+    // Bun's 5s default is too short for the process-spawning suites on a loaded machine.
     const { code, output } = run(["test", "--timeout", "120000", ...(mocks ? ["--preload", hook] : []), `./${name}`], 240_000)
     expect(code, output).toBe(0)
   }, 250_000)
 }
 
-
-test("test/re2-pattern-unit.mjs", () => {
-  const { code, output } = run([path.join(dir, "re2-pattern-unit.mjs")], 60_000)
-  expect(code, output).toBe(0)
-}, 70_000)
-
-test("test/smoke.mjs against a fake agy", () => {
-  const { code, output } = run([path.join(dir, "smoke.mjs")], 240_000)
-  expect(code, output).toBe(0)
-}, 250_000)
-
-test("test/array-items-unit.mjs", () => {
-  const { code, output } = run([path.join(dir, "array-items-unit.mjs")], 60_000)
-  expect(code, output).toBe(0)
-}, 70_000)
-
-test("test/documents-unit.mjs", () => {
-  const { code, output } = run([path.join(dir, "documents-unit.mjs")], 60_000)
-  expect(code, output).toBe(0)
-}, 70_000)
+for (const name of ["re2-pattern-unit.mjs", "array-items-unit.mjs", "documents-unit.mjs"]) {
+  test(`test/${name}`, () => {
+    const { code, output } = run([path.join(dir, name)], 60_000)
+    expect(code, output).toBe(0)
+  }, 70_000)
+}

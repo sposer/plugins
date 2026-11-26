@@ -10,7 +10,7 @@ const json = (value, status = 200) => new Response(JSON.stringify(value), { stat
 const fresh = { access_token: "sandbox-access", refresh_token: "sandbox-refresh", token_type: "Bearer", expires_in: 3600 }
 
 async function fixture(t, options) {
-  const kit = await createBridgeKit(options)
+  const kit = await createBridgeKit({ runTui: async () => ({ text: "signed-in turn" }), ...options })
   const original = globalThis.fetch
   const calls = []
   let tokenReply = () => json(fresh)
@@ -33,7 +33,7 @@ function callback(url, params) {
   return target.href
 }
 
-test("configured authorization checks state and PKCE, writes native storage and serves an ACP request", async t => {
+test("configured authorization checks state and PKCE and uses the saved home for a native turn", async t => {
   const f = await fixture(t)
   const login = await f.methods[2].authorize({ redirect_uri: "http://localhost:8085/callback" })
   const url = link(login)
@@ -54,8 +54,10 @@ test("configured authorization checks state and PKCE, writes native storage and 
   assert.equal((await login.callback(callback(url))).type, "failed")
   assert.equal(fs.existsSync(home), true)
   const loader = await f.kit.plugin.auth.loader(() => result)
-  await readSse(await loader.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(baseBody()) }))
-  assert.ok(f.kit.acpSpawns.some(spawn => spawn.env.HOME === home && spawn.args.includes("--agent")))
+  const reply = await readSse(await loader.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(baseBody({ tools: [] })) }))
+  assert.deepEqual(reply.content, [{ type: "text", text: "signed-in turn" }])
+  assert.equal(f.kit.tuiRuns[0].env.HOME, home)
+  assert.deepEqual(f.kit.modelsSpawns.map(call => call.env.HOME), [home])
   assert.equal(f.homes().length, 1)
 })
 
@@ -83,10 +85,12 @@ test("token login validates refresh with the entered client and persists native 
   assert.equal(form.get("refresh_token"), "submitted-refresh")
   assert.equal(f.calls.length, 1)
   const loader = await f.kit.plugin.auth.loader(() => result)
-  await readSse(await loader.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(baseBody()) }))
-  const spawn = f.kit.acpSpawns.find(spawn => spawn.args.includes("--agent"))
-  assert.equal(spawn.env.AGY_ADC_AUTH, "true")
-  assert.equal(spawn.env.GOOGLE_APPLICATION_CREDENTIALS, path.join(home, ".gemini", "antigravity-cli", "oauth-client.json"))
+  const reply = await readSse(await loader.fetch("agy://local/v1/messages", { method: "POST", body: JSON.stringify(baseBody({ tools: [] })) }))
+  assert.equal(reply.stopReason, "end_turn")
+  const [{ env }] = f.kit.tuiRuns
+  assert.equal(env.HOME, home)
+  assert.equal(env.AGY_ADC_AUTH, "true")
+  assert.equal(env.GOOGLE_APPLICATION_CREDENTIALS, path.join(home, ".gemini", "antigravity-cli", "oauth-client.json"))
   assert.equal((await login.callback()).type, "failed")
   assert.equal(fs.existsSync(home), true)
 })
@@ -165,6 +169,10 @@ test("invalid token fields, write errors and native verification failures discar
   const probes = f.kit.modelsSpawns.length
   assert.equal((await writing.callback()).type, "failed")
   assert.equal(f.kit.modelsSpawns.length, probes)
+  assert.equal(f.homes().length, 0)
+  const verifying = await f.methods[3].authorize({ refresh_token: "refresh", email: "sandbox@example.com" })
+  assert.equal((await verifying.callback()).type, "failed")
+  assert.equal(f.kit.modelsSpawns.length, probes + 1)
   assert.equal(f.homes().length, 0)
   assert.equal(f.kit.children.size, 0)
   assert.equal(f.kit.timers.refed().length, 0)

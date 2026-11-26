@@ -86,8 +86,8 @@ export function agySpawnSpec(file, args, platform = process.platform, env = proc
 // The environment an agy child runs with. A value the user set for
 // AGY_CLI_DISABLE_AUTO_UPDATE (in the parent's environment or the caller's)
 // is kept as written. Only when nobody set it do the plugin's children run
-// with auto-update off, so a pool of ACP processes doesn't update the binary
-// under each other; the user's own `agy` runs keep updating. Work for an
+// with auto-update off, so concurrent native CLI processes don't update the
+// binary under each other; the user's own `agy` runs keep updating. Work for an
 // account with a home of its own (account.mjs) runs agy in that home.
 export function childEnv(parent = process.env, extra = {}, platform = process.platform) {
   const env = {}
@@ -126,30 +126,7 @@ export function stopAgy(child) {
   try { child.kill("SIGKILL") } catch {}
 }
 
-export function windowsMcpShim(executable, server) {
-  const quote = value => {
-    if (/["\0\r\n]/.test(value)) throw new Error("invalid Windows MCP shim path")
-    return `"${value.replace(/%/g, "%%")}"`
-  }
-  return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${quote(executable)} ${quote(server)}\r\n`
-}
-
-// agy dials --ide-mcp-port by running `nc` from PATH. On Windows a console
-// program started that way can be handed a console of its own, and nc.cmd
-// always runs in cmd.exe, a console program: each dial then flashes a window
-// and leaves a conhost.exe behind (#1047). A GUI-subsystem nc.exe never gets
-// a console, whatever creation flags agy uses, and still talks over the
-// stdio pipes agy hands it. Bun builds it from mcp-server.mjs on the user's
-// own machine; nothing prebuilt ships. magpie runs plugins on a Bun it keeps
-// as magpie-bun(.exe), so that name counts as Bun too. Another runtime (an
-// opencode build, Node) gets null, and the caller falls back to nc.cmd.
-export function windowsNcBuild(runtime, server, outfile, versions = process.versions) {
-  if (!versions?.bun || !/^(?:magpie-)?bun(?:\.exe)?$/i.test(path.win32.basename(String(runtime || "")))) return null
-  return { file: runtime, args: ["build", "--compile", "--windows-hide-console", server, "--outfile", outfile] }
-}
-
-// One taskkill run that ends each agy and everything it started (cmd.exe,
-// nc); null when there is nothing to end.
+// One taskkill run ends each CLI process tree; null when there is nothing to end.
 export function windowsTreeKill(pids) {
   const live = [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0)
   if (!live.length) return null

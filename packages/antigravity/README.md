@@ -5,8 +5,8 @@ calling Code Assist the way this plugin does (Antigravity's own client,
 outside the Antigravity app). magpie keeps it working for whoever has it
 already, tells them the risk, and installs it for nobody new. Use
 [Antigravity (local agy CLI)](../agy-cli/README.md),
-`@magpie-community/opencode-agy-cli-auth`, which runs the `agy` you
-installed and signed in to yourself.
+`@magpie-community/opencode-agy-cli-auth`, which runs the local `agy`
+interactive terminal on a Linux plugin host.
 
 Signs in to **Antigravity** with a Google account (Google AI Pro, Ultra or
 the free tier) and calls the models Antigravity serves: Gemini, and the

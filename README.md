@@ -13,7 +13,7 @@ vendor service and makes its requests. The packages work in OpenCode and in
 |---|---|---|
 | [agnes](packages/agnes) | Agnes AI international (agnes-ai.com), with Chrome browser sign-in, live text models, plan usage and USD balance | `agnes` |
 | [agnes-code](packages/agnes-code) | Agnes AI's Agnes Code desktop, with the desktop's saved session (Windows) or a pasted access token: live models, daily credit check-in and points balance (unofficial) | `agnes-code` |
-| [agy-cli](packages/agy-cli) | Antigravity on your installed agy CLI through ACP (`agy acp`), with agy's own Google sign-in: only the models agy offers this client, a process pool, MCP tool bridge and session resume (unofficial) | `agy-cli` |
+| [agy-cli](packages/agy-cli) | Antigravity through the local agy CLI's interactive terminal on Linux: account models from `agy models`, an MCP bridge for client tools, image input and quota windows (unofficial) | `agy-cli` |
 | [antigravity](packages/antigravity) | Withdrawn for new users: Google suspends accounts it sees used this way. Kept working for whoever has it; use agy-cli instead | `antigravity` |
 | [astudio](packages/astudio) | iFlytek's AStudio (科大讯飞 Astron Studio desktop), with the desktop's saved credentials or a pasted model token: live model catalog, daily login-points check-in and points balance (unofficial) | `astudio` |
 | [atomcode](packages/atomcode) | AtomGit CodingPlan, with browser OAuth or the local AtomCode CLI's sign-in, signed requests, live models, quota windows and a read-only diagnostics page (unofficial) | `atomcode` |

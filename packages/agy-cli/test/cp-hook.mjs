@@ -1,4 +1,4 @@
-// Preloaded for test/platform.mjs, test/compat.mjs and test/usage.mjs under bun.
+// Preloaded for suites that replace childProcess.spawn under Bun.
 // Those tests replace childProcess.spawn and call syncBuiltinESMExports(), which
 // Node uses to push the change into named imports. Bun has no such step, so
 // node:child_process is mocked once here: its default export is a plain object

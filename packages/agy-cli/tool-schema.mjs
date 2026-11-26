@@ -1,4 +1,4 @@
-// Expand JSON Schema constructs that agy's ACP -> CloudCode Schema translator
+// Expand JSON Schema constructs that agy's CloudCode Schema translator
 // either ignores or drops (`$ref` into `$defs`/`definitions`, `allOf`, `oneOf`,
 // object/primitive `anyOf` unions, `const` discriminators, `additionalProperties`
 // dictionaries, and boolean schemas), before `sanitizeInputSchema` and

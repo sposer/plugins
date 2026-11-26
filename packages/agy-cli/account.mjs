@@ -57,6 +57,14 @@ export function tokenFile(home) {
   return path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
 }
 
+// The private terminal can consume these credentials without the system keyring.
+export function terminalCredential(env) {
+  if (env.AGY_ADC_AUTH === "true" && env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return { file: path.resolve(env.GOOGLE_APPLICATION_CREDENTIALS), adc: true }
+  }
+  if (env.HOME) return { file: tokenFile(env.HOME), home: env.HOME }
+}
+
 export function adcFile(home) {
   return path.join(home, ".gemini", "antigravity-cli", "oauth-client.json")
 }
@@ -70,7 +78,7 @@ export function writeTokenFile(home, text, adc = null) {
   fs.writeFileSync(file, text, { mode: 0o600 })
 }
 
-// accountEnv is what every CLI path (models, usage and ACP) consumes.
+// accountEnv is shared by model discovery, usage, and the native terminal.
 export function accountEnv(home, platform = process.platform) {
   const adc = fs.existsSync(adcFile(home))
   return {

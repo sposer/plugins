@@ -1,7 +1,7 @@
 {
   "name": "@magpie-community/opencode-agy-cli-auth",
-  "version": "0.1.97",
-  "description": "Magpie/OpenCode model provider that runs the local Antigravity CLI through ACP or its interactive terminal",
+  "version": "0.1.98",
+  "description": "Magpie/OpenCode model provider that runs the local Antigravity CLI in its native interactive terminal on Linux",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {
@@ -11,6 +11,7 @@
     "proc.mjs",
     "index.mjs",
     "tui.mjs",
+    "tui-input.mjs",
     "documents.mjs",
     "opencode.mjs",
     "opencode2.mjs",
@@ -19,7 +20,6 @@
     "login.mjs",
     "oauth.mjs",
     "mcp-server.mjs",
-    "step-usage.mjs",
     "tool-schema.mjs", "tool-budget.mjs",
     "usage.mjs",
     "model-ids.mjs",
@@ -41,7 +41,7 @@
     "opencode-plugin",
     "antigravity",
     "agy",
-    "acp"
+    "tui"
   ],
   "license": "MIT",
   "repository": {
