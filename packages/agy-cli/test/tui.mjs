@@ -29,8 +29,15 @@ fs.writeFileSync(STARTED, JSON.stringify(attest));
 process.stderr.write('private stderr fixture\n');
 process.stdin.setRawMode(true);
 let input = '';
+let answered = CASE !== 'device-query';
+const showReady = () => process.stdout.write('\x1b[90m? for shortcuts\x1b[m\r\n');
 process.stdin.setEncoding('utf8').on('data', text => {
   input += text;
+  if (!answered && input.includes('\x1b[?62;c')) {
+    answered = true;
+    input = input.replace('\x1b[?62;c', '');
+    showReady();
+  }
   if (!input.endsWith('\x1b[201~\r')) return;
   process.stdin.pause();
   if (!input.startsWith('\x1b[200~')) process.exit(123);
@@ -57,14 +64,24 @@ process.stdin.setEncoding('utf8').on('data', text => {
     fs.appendFileSync(file, row('PLANNER_RESPONSE','DONE',{ source:'MODEL', content:'not a final reply', tool_calls:[{ name:'run_command' }] }) + '\n' + planner + '\n');
     return;
   }
+  if (CASE === 'steps' || CASE === 'late') {
+    // Steps without reply text, each within the progress bound, then the reply.
+    const step = row('PLANNER_RESPONSE','DONE',{ source:'MODEL', content:'', input_tokens:5, output_tokens:1, cache_read_tokens:3 });
+    const at = CASE === 'steps' ? [250, 500, 750] : [];
+    for (const ms of at) setTimeout(() => fs.appendFileSync(file, step + '\n'), ms);
+    setTimeout(() => fs.appendFileSync(file, planner + '\n'), CASE === 'steps' ? 1000 : 1200);
+    return;
+  }
   fs.appendFileSync(file, planner.slice(0, -5));
   setTimeout(() => fs.appendFileSync(file, planner.slice(-5) + '\n'), 120);
 });
 setInterval(() => {}, 1000);
 if (CASE === 'wait-ready') returnProcess();
+// Readiness only follows the answer to the primary device-attributes query.
+else if (CASE === 'device-query') process.stdout.write('\x1b[?2004h\x1b[c');
 else {
   process.stdout.write('\x1b[?2004h');
-  setTimeout(() => process.stdout.write('\x1b[90m? for shortcuts\x1b[m\r\n'), 30);
+  setTimeout(showReady, 30);
 }
 function returnProcess() { process.on('SIGTERM', () => {}); }
 `
@@ -135,6 +152,38 @@ for (const [name, statusCode] of [["error", 401], ["tool", 502], ["cancelled", 5
     await cleaned(f)
   })
 }
+
+test("each new transcript row restarts the progress bound and adds its step's tokens", linux, async t => {
+  const f = await fixture(t, "steps")
+  const phases = []
+  const progress = []
+  const observer = { phase: name => phases.push(name), progress: usage => progress.push(usage) }
+  // Four rows 250 ms apart outlast a 600 ms bound that each gap stays within.
+  assert.deepEqual(await f.run({ timeoutMs: 600, observer }), {
+    text: "verified reply", thinking: "verified thinking", inputTokens: 24, outputTokens: 5, cacheReadTokens: 16,
+  })
+  assert.deepEqual(phases, ["ready", "submitted"])
+  assert.deepEqual(progress.at(-1), { inputTokens: 24, outputTokens: 5, cacheReadTokens: 16, steps: 4, toolCalls: 0 })
+  await cleaned(f)
+})
+
+test("time spent waiting for a client tool result is not a lack of progress", linux, async t => {
+  const f = await fixture(t, "late")
+  assert.equal((await f.run({ timeoutMs: 500, observer: { waiting: () => true } })).text, "verified reply")
+  await cleaned(f)
+  await assert.rejects(f.run({ timeoutMs: 500 }), err => {
+    assert.equal(err.statusCode, 504)
+    assert.equal(err.phase, "turn")
+    return true
+  })
+  await cleaned(f)
+})
+
+test("the startup device-attributes query is answered before the prompt", linux, async t => {
+  const f = await fixture(t, "device-query")
+  assert.equal((await f.run()).text, "verified reply")
+  await cleaned(f)
+})
 
 test("TUI abort kills a live PTY even when it ignores TERM", linux, async t => {
   const f = await fixture(t, "wait-ready")
