@@ -23,6 +23,7 @@ import { processExists } from "./proc.mjs"
 import { fitTools } from "./tool-budget.mjs"
 import { cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { runTui } from "./tui.mjs"
 
 const PROVIDER_ID = "agy-cli"
 // Client tools reach the session through a private `nc` placed first on agy's
@@ -214,6 +215,8 @@ const FALLBACK_MODELS = [
 const pool = new Map()
 const parked = new Map()
 const allProcs = new Set()
+let activeTui = 0
+const processCount = () => allProcs.size + activeTui
 const sessions = new Map()
 const toolCalls = new Map()
 let cachedAgyPath
@@ -3485,18 +3488,23 @@ async function takeSpare(agyPath, workDir) {
   return spare
 }
 
+function freeAgySlot() {
+  const idle = spares.values().next().value
+  return idle ? dropSpare(idle).then(() => true) : evictLRU()
+}
+
 async function warmSpare(agyPath, workDir) {
   if (!agyPath || !sparesOn()) return
   const key = await launchKey(agyPath, workDir)
   if (spares.has(key)) return
   // never at the cost of a conversation's room
-  if (allProcs.size + 1 >= maxProcs()) return
+  if (processCount() + 1 >= maxProcs()) return
   if (spares.size >= SPARE_MAX) {
     let oldest = null
     for (const spare of spares.values()) if (!oldest || spare.lastUsed < oldest.lastUsed) oldest = spare
     await dropSpare(oldest)
   }
-  if (spares.has(key) || allProcs.size + 1 >= maxProcs()) return
+  if (spares.has(key) || processCount() + 1 >= maxProcs()) return
   const proc = new Proc(agyPath, null, { workDir })
   proc.spareKey = key
   spares.set(key, proc)
@@ -3661,13 +3669,8 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     await existing.stop().catch(() => {})
   }
   const spare = await takeSpare(agyPath, opts.workDir)
-  while (!spare && allProcs.size >= maxProcs()) {
-    const idle = spares.values().next().value
-    if (idle) {
-      await dropSpare(idle)
-      continue
-    }
-    if (!(await evictLRU())) {
+  while (!spare && processCount() >= maxProcs()) {
+    if (!(await freeAgySlot())) {
       throw new BusyError(`agy bridge: ${maxProcs()} agy processes are running and all have unfinished responses`)
     }
   }
@@ -5986,6 +5989,69 @@ function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
+// decision: use TUI for text-only turns, not the ACP tool bridge in a PTY
+// because agy's interactive entrypoint has no --ide-mcp-port or structured
+// tool continuation; revisit when native tool calls and completion can be relayed.
+function tuiEligible(body) {
+  return process.env.AGY_BRIDGE_MODE === "tui" && process.platform === "linux" &&
+    !body.tools?.length && (!body.tool_choice || body.tool_choice.type === "none" || body.tool_choice.type === "auto") &&
+    !body.output_config?.format && !body.response_format &&
+    body.messages.at(-1)?.role === "user" &&
+    body.messages.every(({ content }) => typeof content === "string" ||
+      (Array.isArray(content) && content.every(part => typeof part === "string" || part?.type === "text")))
+}
+
+async function tuiResponse(agy, body, selection, init) {
+  while (processCount() >= maxProcs()) {
+    if (!await freeAgySlot()) return jsonError(503, "agy bridge: all agy process slots are busy")
+  }
+  const prompt = renderInitialPromptParts(body, "", false).map(part => part.text).join("")
+  if (!prompt.trim()) return jsonError(400, "agy bridge: the TUI prompt is empty", undefined, { noRetry: true })
+  activeTui++
+  try {
+    const result = await runTui(agy, {
+      prompt, model: selection.model, effort: selection.effort,
+      signal: init.signal,
+      timeoutMs: configuredTimeout("AGY_BRIDGE_TURN_TIMEOUT_MS", TURN_TIMEOUT_MS),
+      env: childEnv(),
+    })
+    const id = `msg_agy_${randomBytes(12).toString("hex")}`
+    const thinking = FORWARD_THINKING && body.thinking?.type !== "disabled" ? result.thinking : ""
+    const content = [
+      ...(thinking ? [{ type: "thinking", thinking, signature: thinkingSignature(id, thinking) }] : []),
+      { type: "text", text: result.text },
+    ]
+    const usage = { input_tokens: tokenCount(result.inputTokens), output_tokens: tokenCount(result.outputTokens),
+      cache_read_input_tokens: tokenCount(result.cacheReadTokens), cache_creation_input_tokens: 0 }
+    const message = { id, type: "message", role: "assistant", model: body.model, content,
+      stop_reason: "end_turn", stop_sequence: null, usage }
+    const headers = { "X-Magpie-Agy-Mode": "tui" }
+    if (body.stream === false) return Response.json(message, { headers })
+
+    const events = [sseEvent("message_start", { type: "message_start", message: {
+      ...message, content: [], stop_reason: null, usage: { ...usage, output_tokens: 0 },
+    } })]
+    for (const [index, block] of content.entries()) {
+      const start = block.type === "thinking"
+        ? { type: "thinking", thinking: "", signature: "" } : { type: "text", text: "" }
+      events.push(sseEvent("content_block_start", { type: "content_block_start", index, content_block: start }))
+      const deltas = block.type === "thinking"
+        ? [{ type: "thinking_delta", thinking: block.thinking }, { type: "signature_delta", signature: block.signature }]
+        : [{ type: "text_delta", text: block.text }]
+      for (const delta of deltas) events.push(sseEvent("content_block_delta", { type: "content_block_delta", index, delta }))
+      events.push(sseEvent("content_block_stop", { type: "content_block_stop", index }))
+    }
+    events.push(sseEvent("message_delta", { type: "message_delta",
+      delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage }))
+    events.push(sseEvent("message_stop", { type: "message_stop" }))
+    return new Response(events.join(""), { headers: { ...headers, "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+  } catch (error) {
+    return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
+  } finally {
+    activeTui--
+  }
+}
+
 const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_requests: "end_turn", refusal: "refusal" }
 const TOOL_BATCH_WINDOW_MS = 30
 
@@ -7034,8 +7100,9 @@ export const AntigravityBridgePlugin = async () => {
             const layout = requestLayout(body)
             body = { ...foldSplitCalls(canonicalBody(body)), model: requestedModel }
             if (isOrchestrator(requestedModel)) return jsonError(400, orchestratorRefusal(requestedModel), undefined, { noRetry: true })
-            const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
+            if (tuiEligible(body)) return tuiResponse(agy, body, selection, init)
+            const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const sessionScope = requestSessionScope(fetchInput, init)
             // an account's conversations are its own: its agy has them
             const convKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope)

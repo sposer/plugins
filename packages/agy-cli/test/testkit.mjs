@@ -639,6 +639,9 @@ export async function createBridgeKit(options = {}) {
     else if (key === "./account.mjs") module = sourceModule(ACCOUNT_FILE, "", accountUrl)
     else if (key === "./import.mjs") module = sourceModule(IMPORT_FILE, "", importUrl)
     else if (key === "./documents.mjs") module = sourceModule(DOCUMENTS_FILE, "", documentsUrl)
+    else if (key === "./tui.mjs") module = new vm.SyntheticModule(["runTui"], function init() {
+      this.setExport("runTui", options.runTui || (() => { throw new Error("testkit: unexpected TUI launch") }))
+    })
     else if (key === "./oauth.mjs") module = sourceModule(path.join(REPO_DIR, "oauth.mjs"), "", pathToFileURL(path.join(REPO_DIR, "oauth.mjs")).href)
     else if (key === "oauth4webapi") module = builtinModule(key)
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])

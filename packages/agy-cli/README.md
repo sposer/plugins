@@ -8,9 +8,9 @@ OpenCode、Claude Code 等客户端经由 Magpie 调用 agy 向本插件开放�
 
 ## 这是什么
 
-插件以 Magpie provider 的形式运行。客户端发来 Anthropic Messages 格式的请求，插件把它
-翻译成 ACP（Agent Client Protocol）消息，交给本机的 `agy acp` 进程处理，再把输出翻译回
-流式响应。
+插件以 Magpie provider 的形式运行。客户端发来 Anthropic Messages 格式的请求。默认由插件翻译成 ACP（Agent Client Protocol）消息，
+交给本机的 `agy acp` 进程，再把输出转回流式响应。Linux 也可选择[原生 TUI](#原生-tui)，
+让符合条件的文本请求走 `agy` 的交互入口。
 
 - 底层是真正的 agy CLI，走它自带的 ACP 通道。ACP 握手里的 `clientInfo` 是本插件自己的
   包名和版本（`opencode-agy-cli-auth`），不冒充 Zed 或其它编辑器。插件在配置 OAuth 登录时完成
@@ -149,9 +149,20 @@ magpie plugin add @magpie-community/opencode-agy-cli-auth
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
 3. 在客户端里选用这个模型即可。
 
+## 原生 TUI
+
+在运行插件的进程环境中设置 `AGY_BRIDGE_MODE=tui`，Linux 上符合条件的纯文本请求就会进入
+`agy` 的交互终端。需要 util-linux 提供的 `script`，已用 agy 1.5.18 验证。不设置变量时仍全部走 ACP。
+
+TUI 每个请求新开一个会话，按提示词预算带上文本历史，回合完成后读出回复并清理进程及临时目录。
+流式客户端仍收到 SSE，但正文在回合完成后一次发出。会话只携带所选账号的文件令牌或已配置的
+ADC 凭据，不加载原 HOME 的 agy 设置。带工具、图片、结构化输出或助手预填的请求仍走 ACP；
+已经开始的 TUI 请求失败时不会再经 ACP 发一遍。模型列表、登录和用量查询沿用现有路径。
+原生终端可能把制表符展开为空格。若要恢复全部走 ACP，移除该环境变量。
+
 ## 并发
 
-- 插件自己的进程池上限由 `AGY_BRIDGE_MAX_PROCS` 决定，默认 16 个 agy 进程。
+- ACP 和 TUI 共用 `AGY_BRIDGE_MAX_PROCS` 上限，默认 16 个 agy 进程。
 - Magpie 的 Providers 页有单独的 Concurrency 设置，可填 0–1000，0 表示不限制。
   你在页面里改的值会覆盖 `package.json` 里 `magpie.maxConcurrency` 的默认声明（16）。
 - 进程池已满、又找不到可以淘汰的进程时，插件返回 HTTP 503。建议两处数值保持一致：

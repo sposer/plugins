@@ -10,10 +10,10 @@ an `agy` process.
 
 ## What it is
 
-The plugin runs as a Magpie provider. A client sends an Anthropic Messages
-request; the plugin turns it into Agent Client Protocol (ACP) messages, hands
-them to a local `agy acp` process, and converts the output back into a streamed
-response.
+The plugin runs as a Magpie provider. By default it turns an Anthropic Messages
+request into Agent Client Protocol (ACP) messages, hands them to a local `agy acp`
+process, and streams the output back. On Linux, [native TUI](#native-tui) can
+send eligible text requests through agy's interactive entrypoint instead.
 
 - The work is done by the real agy CLI over the ACP channel it ships with. The
   ACP handshake's `clientInfo` is the plugin's own package name and version
@@ -216,10 +216,27 @@ After installing, sign in from Magpie; no terminal needed.
    and each request is mapped back to the matching agy ID.
 3. Pick the model in your client as usual.
 
+## Native TUI
+
+Set `AGY_BRIDGE_MODE=tui` in the plugin host's environment to send eligible
+plain-text requests through agy's interactive terminal on Linux. It requires
+util-linux `script` and was verified with agy 1.5.18. Without the variable the
+plugin uses ACP for all requests.
+
+TUI starts a new session per request, includes text history within the prompt
+budget, and cleans up the process and temporary directory when the turn ends.
+Clients that ask for streaming still receive SSE, but the reply is sent once the
+turn completes. The session uses the selected account's token file or configured
+ADC credentials, not agy's settings from the original home directory. Requests
+with tools, images, structured output or an assistant prefill still use ACP. A
+started TUI turn is not retried through ACP. Sign-in, quota and model discovery
+are unchanged. The terminal may expand tabs to spaces. To return to ACP for all
+requests, remove the environment variable.
+
 ## Concurrency
 
-- The plugin's own pool is capped by `AGY_BRIDGE_MAX_PROCS`, which defaults to 16
-  agy processes.
+- ACP and TUI share the `AGY_BRIDGE_MAX_PROCS` limit, which defaults to 16 agy
+  processes.
 - Magpie's Providers page has its own Concurrency field that accepts 0 to 1000,
   where 0 means no limit. A value set there overrides the default of 16 that the
   plugin declares in `magpie.maxConcurrency`.
