@@ -245,12 +245,19 @@ test("real Antigravity PTY carries images and resumes the original turn after a 
     if (main && !body.includes('"functionResponse"')) {
       if (mode === "tool") parts = [{ text: "not a final reply" }, { functionCall: { name: "run_command",
         args: { CommandLine: `touch ${witness}`, toolSummary: "Create a test witness", WaitMsBeforeAsync: 500 } } }]
-      if (mode === "bridge") parts = [{ text: "not a final reply" }, { functionCall: { name: functionName,
-        args: { ...argumentsFromModel, toolSummary: "Call the bridge fixture" } } }]
+      if (mode === "bridge") parts = [{ text: "thinking before tool", thought: true },
+        { text: "not a final reply" }, { functionCall: { name: functionName,
+          args: { ...argumentsFromModel, toolSummary: "Call the bridge fixture" } } }]
     }
     const reply = { candidates: [{ content: { parts, role: "model" }, finishReason: "STOP", index: 0 }], modelVersion: model,
     usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 5, cachedContentTokenCount: 2, totalTokenCount: 9 } }
     res.writeHead(200, { "Content-Type": "text/event-stream" })
+    if (main && mode === "bridge" && parts.some(part => part.functionCall)) {
+      // AGY records thoughts preceding a function call when the upstream writes them first.
+      const chunk = { candidates: [{ content: { parts: [parts.shift()], role: "model" }, index: 0 }], modelVersion: model }
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+      await delay(200)
+    }
     res.end(`data: ${JSON.stringify(reply)}\n\n`)
   })
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve))
@@ -306,12 +313,15 @@ test("real Antigravity PTY carries images and resumes the original turn after a 
   assert.equal(first.headers.get("X-Magpie-Agy-Mode"), "tui")
   const reply = await first.json()
   assert.equal(reply.stop_reason, "tool_use")
-  assert.deepEqual(reply.content.map(({ id, ...block }) => block), [{ type: "tool_use", name: tool.name, input: argumentsFromModel }])
+  assert.deepEqual(reply.content.map(({ id, signature, ...block }) => block), [
+    { type: "thinking", thinking: "thinking before tool" },
+    { type: "tool_use", name: tool.name, input: argumentsFromModel },
+  ])
   await delay(350)
   assert.equal(requests.length, 1)
   const followup = await request({ ...initial, messages: [
     ...initial.messages, { role: "assistant", content: reply.content },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: reply.content[0].id, content: toolResult }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: reply.content.at(-1).id, content: toolResult }] },
   ] })
   assert.equal(followup.status, 200)
   assert.equal(followup.headers.get("X-Magpie-Agy-Mode"), "tui")

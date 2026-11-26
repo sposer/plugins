@@ -380,12 +380,12 @@ function buildModelCatalog(list) {
   return { models, routes, raw }
 }
 
-function selectTerminalModel(agyPath, model, body) {
+function selectTerminalModel(agyPath, model, body, headers) {
   // Serve from the same account catalog used for discovery, without running a
   // second CLI process on the request path.
   useAgyPath(agyPath)
   const { routes, raw } = catalogOf(ms().cachedModelCatalog)
-  const effort = requestedEffort(body)
+  const effort = requestedEffort(body, headers)
   const family = routes.get(model)
   if (!family) return { model, effort: raw.get(model)?.effort ? "" : effort }
   let selected = family.defaultEffort
@@ -557,11 +557,15 @@ function normalizeEffort(value) {
   return EFFORT_ORDER.includes(direct) ? direct : ""
 }
 
-function requestedEffort(body) {
+function requestedEffort(body, headers) {
   const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
   if (forced) return forced
   const thinking = body.thinking?.type
   if (thinking === "disabled") return ""
+  // decision: prefer Magpie's picked level; not the translated body because
+  // protocol limits and output caps can lower the body's thinking budget.
+  const picked = normalizeEffort(new Headers(headers).get("x-magpie-effort"))
+  if (picked) return picked
   const generic = [body.reasoning_effort, body.reasoningEffort, body.reasoning?.effort,
     body.generationConfig?.thinkingConfig?.thinkingLevel].map(normalizeEffort).find(Boolean)
   if (generic) return generic
@@ -2298,6 +2302,7 @@ class TuiTurn {
     this.usage = zeroUsage()
     this.reported = zeroUsage()
     this.usageWaiters = new Set()
+    this.toolThinking = []
   }
 
   // Ends the native turn once; the first reason is the one reported.
@@ -2390,8 +2395,8 @@ class TuiTurn {
 
   start(agy, options, cause) {
     tuiTurns.add(this)
-    logBridgeEvent("turn_start", { turn: this.id, tools: this.tools.length, images: options.parts ? options.parts.length - 1 : 0,
-      ...(cause ? { replay: cause } : {}) })
+    logBridgeEvent("turn_start", { turn: this.id, model: options.model.slice(0, 128), ...(options.effort ? { effort: options.effort } : {}),
+      tools: this.tools.length, images: options.parts ? options.parts.length - 1 : 0, ...(cause ? { replay: cause } : {}) })
     this.closed = (async () => {
       let event
       try {
@@ -2400,6 +2405,7 @@ class TuiTurn {
         event = { result: await runTui(agy, { ...options, signal: this.abort.signal, mcp, observer: {
           waiting: () => this.waiting(),
           progress: usage => this.progress(usage),
+          toolThinking: FORWARD_THINKING ? text => this.toolThinking.push(text) : undefined,
           phase: name => { this.phases[`${name}_ms`] = Date.now() - this.startedAt },
         } }) }
       } catch (error) {
@@ -2642,7 +2648,9 @@ async function tuiMessage(turn, body, signal) {
   // The turn ended while this call waited for its usage row; its MCP request is gone.
   if (call && turn.ended) throw turn.ended.error ?? Object.assign(new Error("agy bridge: the native TUI turn ended"), { statusCode: 502 })
   const id = `msg_agy_${randomBytes(12).toString("hex")}`
-  const thinking = FORWARD_THINKING && body.thinking?.type !== "disabled" ? result.thinking : ""
+  const thoughts = turn.toolThinking.splice(0)
+  if (result.thinking) thoughts.push(result.thinking)
+  const thinking = FORWARD_THINKING && body.thinking?.type !== "disabled" ? thoughts.join("\n\n") : ""
   const content = [
     ...(thinking ? [{ type: "thinking", thinking, signature: thinkingSignature(id, thinking) }] : []),
     ...(result.text ? [{ type: "text", text: result.text }] : []),
@@ -3072,10 +3080,11 @@ export const AntigravityBridgePlugin = async () => {
             // derives a key, instructions or history from the body.
             body = { ...foldSplitCalls(canonicalBody(body)), model: requestedModel }
             if (isOrchestrator(requestedModel)) return jsonError(400, orchestratorRefusal(requestedModel), undefined, { noRetry: true })
-            const selection = selectTerminalModel(agy, requestedModel, body)
             const request = fetchInput instanceof Request ? fetchInput : undefined
+            const headers = init.headers ?? request?.headers
+            const selection = selectTerminalModel(agy, requestedModel, body, headers)
             return tuiResponse(agy, body, selection, {
-              headers: init.headers ?? request?.headers, signal: init.signal ?? request?.signal,
+              headers, signal: init.signal ?? request?.signal,
             }, { home, scope: requestSessionScope(fetchInput, init) })
           }),
         }

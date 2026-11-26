@@ -163,10 +163,13 @@ class Transcript {
   #requestPrefix
   #expandedPrefix
   #allowedToolCalls
+  #onToolThinking
+  #thinkingThrough = 0
   #reply
 
-  constructor(brain, prompt, allowedToolCalls) {
+  constructor(brain, prompt, allowedToolCalls, onToolThinking) {
     this.#brain = brain
+    this.#onToolThinking = onToolThinking
     this.#requestPrefix = `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>`
     // In 1.5.18 the TUI can expand pasted tabs to four spaces on short inputs.
     this.#expandedPrefix = this.#requestPrefix.replaceAll("\t", "    ")
@@ -249,8 +252,13 @@ class Transcript {
       if (!planner || !Array.isArray(row.tool_calls) || !row.tool_calls.every(call => this.#allowedToolCalls.has(call?.name))) {
         throw tuiError("the native TUI requested an unapproved tool")
       }
-      // One step can request several calls; AGY then sends them to MCP one at a time.
+      // One step's thinking belongs to its first call, even when AGY sends several.
+      const firstCall = this.usage.toolCalls + 1
       this.usage.toolCalls += row.tool_calls.length
+      if (firstCall > this.#thinkingThrough) {
+        this.#thinkingThrough = firstCall
+        if (typeof row.thinking === "string" && row.thinking) this.#onToolThinking?.(row.thinking)
+      }
       // DONE refers to the planner step, not the turn. The MCP request may still be waiting.
       this.#reply = undefined
       return
@@ -406,7 +414,7 @@ export async function runTui(agyPath, {
     // gateway prompts to other processes running as the same user.
     await input.paste(child.stdin, pause, () => screen.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""))
     limit(Math.min(SUBMIT_TIMEOUT, timeoutMs))
-    const transcript = new Transcript(local.brain, text, allowedToolCalls)
+    const transcript = new Transcript(local.brain, text, allowedToolCalls, observer.toolThinking)
     for (;;) {
       await transcript.read()
       check()

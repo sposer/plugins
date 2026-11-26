@@ -48,8 +48,9 @@ up to date when in use and does not replace one you installed yourself.
    Magpie. Reusing CLI credentials, configured OAuth and file imports do not
    need this sign-in terminal.
 2. Select `agy-cli/<model>` in your client. When agy lists different IDs for
-   thinking levels of the same model, Magpie shows them as variants of one model
-   and the plugin maps each request back to the matching agy ID.
+   thinking levels of the same model, Magpie shows them as variants. The plugin
+   maps Magpie's chosen level to the nearest agy variant without inferring it
+   from a translated token budget. Naming a variant ID pins that level.
 
 Accounts added through a new sign-in or file import get their own agy homes
 under `~/.local/state/magpie-agy-bridge/accounts/` (or the equivalent under
@@ -112,10 +113,10 @@ back off for 10 minutes at first, doubling up to six hours.
 - **Images**: The plugin accepts inline base64 PNG, JPEG and WebP, not GIF or
   image URLs. agy receives images as clipboard attachments and places them
   after the text. The plugin marks each original image position by number.
-- **Streaming**: Streaming clients still receive SSE. Tool requests can be sent
-  before the native turn ends, but text and thinking come from completed
-  transcript entries, not token-by-token updates. The terminal may expand tabs
-  to spaces.
+- **Streaming**: Streaming clients receive SSE. If agy records thinking for a
+  tool step, the plugin sends it with that step's first tool call rather than
+  waiting for the turn to end. Text and thinking come from completed transcript
+  entries, not token-by-token updates. The terminal may expand tabs to spaces.
 - **Structured output and assistant prefill**: Structured output uses prompt
   instructions, not a provider-enforced schema. A request ending in a text-only
   assistant message adds that text to the prompt for continuation rather than
