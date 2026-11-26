@@ -97,11 +97,18 @@ back off for 10 minutes at first, doubling up to six hours.
   and replays history within the prompt's byte budget. The terminal uses a
   separate home and working directory, without loading your usual settings or
   MCP configuration. The plugin cleans up the process and temporary directory
-  when the turn ends.
+  when the turn ends. Control characters in the history reach the editor as
+  Unicode control pictures such as `␛`, as plain text.
 - **Tools**: A private MCP connection forwards agy's native tool calls to the
   client for execution. agy sends calls one at a time. Each matching
   `tool_result` continues the same native turn. If a tool returns an image,
   the plugin starts a new native turn with the actual result and attachment.
+  A result whose native turn has ended, given up its slot or belongs to
+  another session also replays with the history in a new native turn.
+- **Usage**: Each response reports the input, output and cache-read tokens of
+  the native steps completed since the previous response; a response with no
+  new step reports zero. agy records no cache-write count, so
+  `cache_creation_input_tokens` is always 0.
 - **Images**: The plugin accepts inline base64 PNG, JPEG and WebP, not GIF or
   image URLs. agy receives images as clipboard attachments and places them
   after the text. The plugin marks each original image position by number.
@@ -124,8 +131,14 @@ extract the text another way.
 ## Concurrency and timeouts
 
 - The plugin runs up to 16 generation turns at once; set `AGY_BRIDGE_MAX_PROCS`
-  to change this. A turn waiting for a client tool result occupies a slot, and
-  the wait counts towards its timeout.
+  to change this. A turn waiting for a client tool result occupies a slot. When
+  every slot is taken, the turn whose client has held its tool call longest,
+  beyond 30 seconds, gives up its slot; that client's later result replays in a
+  new native turn.
+- The turn timeout bounds how long a native turn may go without a new
+  transcript entry. Time spent waiting for a client tool result does not count;
+  each tool result has its own wait limit. agy has at most 30 seconds each to
+  start and to accept the prompt. A timeout returns HTTP 504.
 - Magpie has a separate **Concurrency** field on its Providers page. It
   defaults to 16 and accepts 0 to 1000, where 0 means no limit on Magpie's side.
   The plugin returns HTTP 503 when all its slots are busy. Raising the
@@ -137,7 +150,8 @@ extract the text another way.
 |---|---|---|
 | `AGY_PATH` | PATH lookup | Path to the agy executable |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum number of concurrent generation turns |
-| `AGY_BRIDGE_TURN_TIMEOUT_MS` | 300000 | Total time budget for a native turn in milliseconds, including waiting for tool results |
+| `AGY_BRIDGE_TURN_TIMEOUT_MS` | 300000 | Longest time in milliseconds a native turn may go without a new transcript entry, excluding waits for tool results |
+| `AGY_BRIDGE_TOOL_TIMEOUT_MS` | 1800000 | Longest time in milliseconds a native turn waits for one client tool result |
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
 | `AGY_BRIDGE_THINKING` | on | Set to `0` to omit `thinking` blocks; to disable for one request, send `thinking: { "type": "disabled" }` |
 | `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
@@ -146,6 +160,7 @@ extract the text another way.
 | `AGY_BRIDGE_PREFILL` | on | Set to `0` to reject assistant prefill with HTTP 400 |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English note | Override the note sent to the model before the prefill text |
 | `AGY_BRIDGE_MCP_TRACE` | unset | Write MCP traffic to the supplied path for debugging |
+| `AGY_BRIDGE_EVENTS` | on | Set to `0` to stop writing `[agy-bridge]` turn events to stderr; events carry no prompts, arguments or results, at most 30 lines a minute |
 | `AGY_CLI_DISABLE_AUTO_UPDATE` | `true` for the plugin's agy processes | Prevent concurrent generation processes from updating the same binary; a value you set is preserved |
 
 ## Troubleshooting
@@ -156,9 +171,12 @@ extract the text another way.
   `/usr/bin/script` on the host or in the container comes from util-linux.
 - **“You do not have a valid license of this product”**: agy reports that the
   account is not eligible. Check `agy models` with the same account.
-- **A tool result returns HTTP 409**: Check that the client preserved the
-  original tool call ID and matching history and sent the result before the
-  turn timed out. A completed native turn cannot be resumed.
+- **A tool result returns HTTP 409**: The native turn received its tool result
+  while another request was still reading it, usually a client retry before the
+  previous request ended. Send the result again after that request ends.
+- **HTTP 504**: The message tells apart agy not becoming ready, not accepting
+  the prompt and a turn with no progress. The `turn_end` line of
+  `[agy-bridge]` on stderr gives the `reason`, `phase` and per-phase times.
 - **Usage shows “Limits not available” or a version error**: The first means
   the window has no measurable data. For a version error, upgrade agy to 1.1.11
   or later.
